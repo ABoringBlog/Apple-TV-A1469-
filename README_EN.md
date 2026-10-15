@@ -15,6 +15,7 @@ Each application is independently installable, has its own package ID and releas
 | **Weather** | Native weather in English or Chinese; requires Mac ATV3Bridge 24/7 | [weather-v1.0.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/weather-v1.0.0-public2) |
 | **Radio** | Native Internet Radio in English or Chinese; requires Mac ATV3Bridge Radio | [radio-v0.3.1-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/radio-v0.3.1-public2) |
 | **CloudTune** | Independent music client; 1.1 adds phone-input search integration | [cloudtune-v1.1.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/cloudtune-v1.1.0-public2) |
+| **[Folia for Apple TV 3 (Mac Bridge)](Folia/)** | Unofficial ATV3 receiver; **requires a separately modified Folia desktop app on an awake Mac**; not standalone | [Source preview](Folia/) |
 | **Phone Remote & Text Input** | iPhone Control Center Remote + keyboard input for ATV3 | [phone-remote-input-v1.0.0-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/phone-remote-input-v1.0.0-public1) |
 
 > **Weather runtime requirement:** the current Weather app requires a Mac running ATV3Bridge continuously (24/7) for fresh live data.

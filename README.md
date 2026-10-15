@@ -17,6 +17,7 @@ Independent open-source applications for **jailbroken Apple TV 3 (A1469 / AppleT
 | **[Weather](Weather/)** | Native weather, English + 中文; requires Mac ATV3Bridge 24/7 / 原生天气，依赖 Mac 24 小时桥接 | [weather-v1.0.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/weather-v1.0.0-public2) |
 | **[Radio](Radio/)** | Native Internet Radio, English + 中文; requires Mac ATV3Bridge Radio / 原生网络电台，依赖 Mac Bridge | [radio-v0.3.1-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/radio-v0.3.1-public2) |
 | **[CloudTune / 云律音乐](CloudTune/)** | Independent music client, English + 中文; phone-input search in 1.1 / 独立音乐客户端，1.1 已接入手机输入搜索 | [cloudtune-v1.1.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/cloudtune-v1.1.0-public2) |
+| **[Folia for Apple TV 3 / Folia Mac 桥接](Folia/)** | Unofficial Apple TV 3 Folia receiver. **Requires a separate modified Folia app running on an awake Mac**, not a standalone ATV music app / 需要 Mac Bridge | [Source preview](Folia/) |
 | **[Phone Remote & Text Input](PhoneRemoteInput/)** | iPhone Control Center Remote + keyboard input for ATV3 / iPhone 控制中心遥控器 + 手机文字输入 | [phone-remote-input-v1.0.0-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/phone-remote-input-v1.0.0-public1) |
 
 **All apps are free and do not require sponsorship. / 所有应用免费，赞助完全自愿。**

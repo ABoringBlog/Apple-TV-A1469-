@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>org.atv3.foliadirect</string>
+	<key>CFBundleExecutable</key>
+	<string>FoliaDirect</string>
+	<key>CFBundleName</key>
+	<string>Folia</string>
+	<key>CFBundleDisplayName</key>
+	<string>Folia</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.2</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.2</string>
+	<key>FRApplianceIdentifier</key>
+	<string>foliadirect</string>
+	<key>FRApplianceName</key>
+	<string>Folia</string>
+	<key>FRApplianceIcon</key>
+	<string>AppIcon.png</string>
+	<key>BLForceLegacyNav</key>
+	<false/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleSignature</key>
+	<string>foli</string>
+	<key>FRApplianceDataSourceType</key>
+	<string>All</string>
+	<key>FRAppliancePreferedOrderValue</key>
+	<integer>7</integer>
+	<key>FRHideIfNoCategories</key>
+	<false/>
+	<key>FRRemoteAppliance</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>8.0</string>
+	<key>NSPrincipalClass</key>
+	<string>FoliaDirectAppliance</string>
+	<key>FoliaBridgeHost</key>
+	<string>MAC_LAN_IP</string>
+</dict>
+</plist>
