@@ -1,0 +1,4 @@
+#pragma once
+// Copy to CloudPhotosPublicConfig.h and replace BOTH example values locally. NEVER COMMIT real keys.
+#define CP_API_KEY_NS @"REPLACE_WITH_YOUR_PRIVATE_API_KEY"
+#define CP_INPUT_KEY_NS @"REPLACE_WITH_YOUR_PRIVATE_INPUT_KEY"

@@ -1,0 +1,14 @@
+build/
+*.frappliance/
+CloudPhotosPublicConfig.h
+Sources/CloudPhotos/CloudPhotosPublicConfig.h
+.env
+.env.*
+*.key
+*.token
+*.log
+*.tar
+*.tar.gz
+*.wav
+__pycache__/
+.DS_Store
