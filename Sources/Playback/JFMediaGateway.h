@@ -5,10 +5,9 @@
 @interface JFMediaGateway : NSObject {
     NSURLRequest *_source;
     NSLock *_lock;
-    NSMutableDictionary *_routes;
-    NSMutableDictionary *_routesByParent;
+    NSMutableArray *_routes;
+    NSMutableDictionary *_playlistCache;
     NSMutableSet *_clients;
-    NSUInteger _nextRoute;
     int _listener;
     unsigned short _port;
     BOOL _stopped;

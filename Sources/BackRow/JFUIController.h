@@ -1,6 +1,7 @@
 #import "JFBRMenu.h"
+#import <CoreGraphics/CoreGraphics.h>
 #import "Playback/JFPlaybackController.h"
-@class JFSession, JFSessionHost;
+@class JFSession, JFSessionHost, JFVisualUI, JFArtwork;
 // Presentation/controller bridge only; networking and model state stay in JFSession.
 @interface JFUIController : JFBRMenu {
     JFSession *_session;
@@ -11,9 +12,15 @@
     id _editor;
     NSData *_previewSourceData, *_previewDisplayData;
     NSUInteger _editKind;
+    JFVisualUI *_visual;
+    JFArtwork *_artwork;
+    NSString *_artworkToken, *_searchQuery, *_lastPresentedPlayerState;
+    CGFloat _detailScroll;
+    BOOL _searchActive, _artworkRefreshScheduled;
     NSInteger _page;
     BOOL _allowHTTP, _observing, _passwordEntered, _previewSideInset;
 }
+- (void)synchronizeNativeSelection:(long)row;
 - (BOOL)configurePlaybackBackend:(id<JFPlaybackBackend>)backend;
 @property(nonatomic, readonly) JFPlaybackController *playback;
 - (id)previewControlForRow:(long)row;

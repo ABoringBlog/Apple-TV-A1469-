@@ -1,5 +1,9 @@
 #import "JFBrowser.h"
 static const NSUInteger JFMediaPageSize=100;
+// We fetch server pages privately, but never expose a partial list to BackRow.
+// Fail explicitly if a server returns an unreasonable amount of data rather
+// than truncating a library or exhausting Apple TV 3 memory.
+static const NSUInteger JFMaxListEntries=10000;
 static NSArray *JFVisiblePage(NSArray *items) {
     if (items.count<=JFMediaPageSize) return items;
     return [items subarrayWithRange:NSMakeRange(0,JFMediaPageSize)];
@@ -18,7 +22,8 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     return combined;
 }
 @implementation JFBrowser
-@synthesize page=_page, index=_index, libraries=_libraries, media=_media, detail=_detail, mediaIndex=_mediaIndex, hasMore=_hasMore;
+@synthesize page=_page, index=_index, libraries=_libraries, media=_media, detail=_detail, mediaIndex=_mediaIndex;
+- (BOOL)hasRemainingLibraryItems {return _libraryMore;}
 - (id)initWithClient:(JFClient *)client {
     if ((self=[super init])) {
         if (!client) { [self release]; return nil; }
@@ -62,6 +67,12 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     }
     [selectedID release]; _page=JFLibrariesPage; return YES;
 }
+- (BOOL)refreshUncached:(NSError **)error {
+    // Explicit refresh is opt-in and invalidates future catalog fast-path reads
+    // for this authenticated client. Initial auto-login still uses the cache.
+    _client.catalogNetworkOnly=YES;
+    return [self refresh:error];
+}
 - (BOOL)handleEvent:(NSDictionary *)event {
     id phase=[event objectForKey:@"phase"], button=[event objectForKey:@"button"];
     if (![phase isKindOfClass:[NSString class]] || ![button isKindOfClass:[NSNumber class]]) return NO;
@@ -87,45 +98,128 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     if (b==JFSelect && press) { _page=JFLibraryPage; return YES; }
     return NO; // Menu at root belongs to the eventual host UI.
 }
+- (void)focusLibraryAtIndex:(NSUInteger)index {
+    if (_page==JFLibrariesPage && index<_libraries.count) _index=(NSInteger)index;
+}
+- (BOOL)setDetailFlag:(NSString *)flag enabled:(BOOL)enabled error:(NSError **)error {
+    if (_page!=JFDetailPage || !_detail[@"Id"] || ![@[@"Played",@"Favorite"] containsObject:flag]) return NO;
+    NSString *identifier=_detail[@"Id"];
+    if (![_client setUserFlag:flag item:identifier enabled:enabled error:error]) return NO;
+    NSDictionary *updated=[_client item:identifier error:error];
+    if (!updated) return NO;
+    [_detail release];_detail=[updated copy];
+    return YES;
+}
 - (void)clearMedia {
+    [_queuedLibraryMedia release];_queuedLibraryMedia=nil;
+    _libraryMore=NO;_nextLibraryOffset=0;
     [_media release]; _media=[NSArray new]; [_history removeAllObjects];
     [_detail release]; _detail=nil; [_seriesID release]; _seriesID=nil;
     [_parentID release]; _parentID=nil; [_mediaType release]; _mediaType=nil;
-    _mediaIndex=NSNotFound; _offset=0; _hasMore=NO;
+    _mediaIndex=NSNotFound;
 }
 - (NSDictionary *)snapshot {
     return @{@"page":@(_page), @"libraries":_libraries, @"index":@(_index),
-             @"media":_media, @"mediaIndex":@(_mediaIndex), @"detail":_detail ?: @{}, @"hasMore":@(_hasMore),
+             @"media":_media, @"mediaIndex":@(_mediaIndex), @"detail":_detail ?: @{},
              @"seriesID":_seriesID ?: @""};
 }
 - (void)push {
-    [_history addObject:@{@"page":@(_page),@"media":_media,@"index":@(_mediaIndex),@"series":_seriesID ?: @"",@"more":@(_hasMore)}];
+    [_history addObject:@{@"page":@(_page),@"media":_media,@"index":@(_mediaIndex),@"series":_seriesID ?: @""}];
 }
 - (BOOL)mediaFailed {
     if (![_client hasSession]) [self logout];
     return NO;
 }
+- (BOOL)openFirstLibraryScreenWithType:(NSString *)type error:(NSError **)error {
+    if(error)*error=nil;
+    NSString *ident=[[self selectedLibrary] objectForKey:@"Id"];
+    if(!ident || ![@[@"Movie",@"Series"] containsObject:type])return NO;
+    // Use a genuinely small first request: 10 visible items + 1 lookahead.
+    // Remaining pages are appended after the UI is already interactive.
+    NSArray *page=[_client itemsInLibrary:ident type:type
+                              start:0 limit:11 error:error];
+    if(!page)return [self mediaFailed];
+    NSArray *first=JFVisiblePage(page);
+    NSArray *visible=[first subarrayWithRange:NSMakeRange(0,MIN((NSUInteger)10,first.count))];
+    // The eleventh item is lookahead only; the next server page starts at
+    // index ten, so it must not be published as a separate one-item update.
+    NSArray *deferred=@[];
+    JFPage sourcePage=_page;
+    [self clearMedia];_page=sourcePage;[self push];
+    _parentID=[ident copy];_mediaType=[type copy];
+    [_media release];_media=[JFAppendUniqueMedia(@[],visible) copy];
+    _mediaIndex=_media.count?0:NSNotFound;
+    _queuedLibraryMedia=[deferred copy];
+    _nextLibraryOffset=10;
+    _libraryMore=page.count>10;
+    if(!_libraryMore)_nextLibraryOffset=NSNotFound;
+    _page=JFMediaPage;
+    return YES;
+}
+- (BOOL)appendNextLibraryChunk:(NSError **)error {
+    if(error)*error=nil;
+    if(!_libraryMore || _page!=JFMediaPage)return NO;
+    NSArray *next=nil;
+    BOOL hasNext=NO;
+    if(_queuedLibraryMedia.count) {
+        next=[[_queuedLibraryMedia retain] autorelease];
+        [_queuedLibraryMedia release];_queuedLibraryMedia=nil;
+        hasNext=_nextLibraryOffset!=NSNotFound;
+    } else if(_nextLibraryOffset!=NSNotFound) {
+        NSArray *probe=[_client itemsInLibrary:_parentID type:_mediaType
+                 start:_nextLibraryOffset limit:JFMediaPageSize+1 error:error];
+        if(!probe) {
+            // Preserve already-visible movies on a transient page failure.
+            _libraryMore=NO;
+            return NO;
+        }
+        next=JFVisiblePage(probe);
+        hasNext=probe.count>JFMediaPageSize;
+        _nextLibraryOffset=hasNext?(_nextLibraryOffset+next.count):NSNotFound;
+    } else hasNext=NO;
+    if(next.count) {
+        NSArray *combined=JFAppendUniqueMedia(_media,next);
+        if(combined.count>JFMaxListEntries || combined.count==_media.count) {
+            _libraryMore=NO;return NO;
+        }
+        [_media release];_media=[combined copy];
+    }
+    _libraryMore=hasNext;
+    return YES;
+}
 - (BOOL)openLibraryWithType:(NSString *)type error:(NSError **)error {
+    if (error) *error=nil;
     NSString *identifier=[[self selectedLibrary] objectForKey:@"Id"];
-    NSArray *probe=[_client itemsInLibrary:identifier type:type start:0 limit:JFMediaPageSize+1 error:error];
-    if (!probe) return [self mediaFailed];
-    NSArray *visible=JFVisiblePage(probe);
-    NSArray *items=JFAppendUniqueMedia(@[],visible);
+    if (!identifier) {
+        if (error) *error=[NSError errorWithDomain:@"Jellyfin" code:1007
+                                         userInfo:@{NSLocalizedDescriptionKey:@"No library selected"}];
+        return NO;
+    }
+    // Jellyfin may cap the response size. Fetch every page privately on our
+    // session worker before publishing one complete immutable list to BackRow.
+    // A failure leaves the current page and its selection untouched.
+    NSArray *combined=@[];
+    NSUInteger offset=0;
+    for (;;) {
+        NSArray *probe=[_client itemsInLibrary:identifier type:type
+                                         start:offset limit:JFMediaPageSize+1 error:error];
+        if (!probe) return [self mediaFailed];
+        NSArray *visible=JFVisiblePage(probe);
+        NSUInteger previous=combined.count;
+        combined=JFAppendUniqueMedia(combined,visible);
+        if (combined.count>JFMaxListEntries || (visible.count && combined.count==previous)) {
+            if (error) *error=[NSError errorWithDomain:@"Jellyfin" code:1007
+                                             userInfo:@{NSLocalizedDescriptionKey:@"Invalid or oversized library listing"}];
+            return NO;
+        }
+        if (probe.count<=JFMediaPageSize) break;
+        offset+=visible.count; // Never skip the look-ahead item.
+    }
     JFPage sourcePage=_page;
     [self clearMedia]; _page=sourcePage; [self push];
     _parentID=[identifier copy]; _mediaType=[type copy];
-    [_media release]; _media=[items copy]; _mediaIndex=items.count ? 0 : NSNotFound;
-    _offset=visible.count; _hasMore=probe.count>JFMediaPageSize; _page=JFMediaPage; return YES;
-}
-- (BOOL)loadMore:(NSError **)error {
-    if (error) *error=nil;
-    if (_page!=JFMediaPage || !_hasMore) return YES;
-    NSArray *probe=[_client itemsInLibrary:_parentID type:_mediaType start:_offset limit:JFMediaPageSize+1 error:error];
-    if (!probe) return [self mediaFailed];
-    NSArray *items=JFVisiblePage(probe);
-    NSArray *combined=JFAppendUniqueMedia(_media,items);
-    [_media release]; _media=[combined copy];
-    _offset+=items.count; _hasMore=probe.count>JFMediaPageSize;
+    [_media release]; _media=[combined copy]; _mediaIndex=combined.count ? 0 : NSNotFound;
+    _page=JFMediaPage;
     return YES;
 }
 - (BOOL)openMediaAtIndex:(NSUInteger)index error:(NSError **)error {
@@ -147,7 +241,7 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     _mediaIndex=index; [self push];
     if (next==JFSeasonsPage) { [_seriesID release]; _seriesID=[identifier copy]; }
     [_detail release]; _detail=[detail copy]; [_media release]; _media=items ? [items copy] : [NSArray new];
-    _mediaIndex=items.count ? 0 : NSNotFound; _hasMore=NO; _page=next; return YES;
+    _mediaIndex=items.count ? 0 : NSNotFound; _page=next; return YES;
 }
 - (BOOL)goBack {
     NSDictionary *frame=[[_history lastObject] retain];
@@ -155,7 +249,7 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     _page=[frame[@"page"] integerValue]; _mediaIndex=[frame[@"index"] integerValue];
     [_media release]; _media=[frame[@"media"] retain];
     [_seriesID release]; _seriesID=[frame[@"series"] copy];
-    _hasMore=[frame[@"more"] boolValue]; [_detail release]; _detail=nil;
+    [_detail release]; _detail=nil;
     [_history removeLastObject]; [frame release]; return YES;
 }
 - (BOOL)signOut:(NSError **)error {
@@ -163,7 +257,7 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
 }
 - (void)logout { [self clearMedia]; [_client logout]; [self clear]; _page=JFLoginPage; }
 - (void)dealloc {
-    [_client release]; [_libraries release]; [_media release]; [_history release];
+    [_client release]; [_libraries release]; [_media release]; [_queuedLibraryMedia release]; [_history release];
     [_detail release]; [_seriesID release]; [_parentID release]; [_mediaType release]; [super dealloc];
 }
 @end

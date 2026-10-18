@@ -72,7 +72,7 @@ def verify(package, bundle=None):
         metadata = plistlib.loads(payload[ROOT + '/Info.plist'])
         expected = {'CFBundleExecutable': 'Jellyfin', 'NSPrincipalClass': 'JellyfinAppliance',
                     'CFBundleIdentifier': 'org.jellyfin.atv3', 'CFBundlePackageType': 'BNDL',
-                    'CFBundleName': 'RetroReel3', 'FRApplianceName': 'RetroReel3',
+                    'CFBundleName': 'Jellyfin', 'FRApplianceName': 'Jellyfin',
                     'MinimumOSVersion': '8.0', 'CFBundleVersion': fields['Version'].split('-')[0]}
         require(all(metadata.get(key) == value for key, value in expected.items()), 'Bundle metadata/version mismatch')
         require(metadata.get('CFBundleSupportedPlatforms') == ['iPhoneOS'], 'Wrong bundle platform')
@@ -83,7 +83,7 @@ def verify(package, bundle=None):
         if bundle_version >= (0, 5, 1):
             require(metadata.get('CFBundleDevelopmentRegion') == 'English', 'Missing development region')
             require(LOCALIZED in payload, 'Missing loader localized name')
-            require(plistlib.loads(payload[LOCALIZED]).get('CFBundleName') == 'RetroReel3', 'Wrong loader localized name')
+            require(plistlib.loads(payload[LOCALIZED]).get('CFBundleName') == 'Jellyfin', 'Wrong loader localized name')
         if bundle_version >= (0, 5, 2):
             require(ICON in payload, 'Missing legacy AppIcon.png')
             icon = payload[ICON]

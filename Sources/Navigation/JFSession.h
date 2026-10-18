@@ -20,8 +20,9 @@ extern NSString * const JFSessionChanged;
     NSString *_subtitleItemID, *_subtitleSourceID;
     NSInteger _audioIndex, _subtitleIndex;
     NSInteger _errorCode;
-    NSUInteger _generation, _posterGeneration;
-    BOOL _busy, _closed;
+    NSUInteger _generation, _posterGeneration, _libraryContinuationSerial;
+    BOOL _libraryContinuationScheduled;
+    BOOL _busy, _closed, _visualArtworkMode;
 }
 - (id)initWithURL:(NSURL *)url deviceID:(NSString *)deviceID allowHTTP:(BOOL)allowHTTP;
 @property(nonatomic, readonly, copy) NSDictionary *snapshot;
@@ -39,8 +40,12 @@ extern NSString * const JFSessionChanged;
 - (BOOL)authenticateToken:(NSString *)token;
 - (BOOL)refresh;
 - (BOOL)openLibraryWithType:(NSString *)type;
+- (BOOL)openLibraryAtIndex:(NSUInteger)index type:(NSString *)type; // atomic select + open, no intermediate focus publish
+- (void)setVisualArtworkMode:(BOOL)enabled;
+- (BOOL)focusMediaAtIndex:(NSUInteger)index;
+- (BOOL)focusLibraryAtIndex:(NSUInteger)index;
+- (BOOL)setDetailFlag:(NSString *)flag enabled:(BOOL)enabled;
 - (BOOL)openMediaAtIndex:(NSUInteger)index;
-- (BOOL)loadMore;
 - (BOOL)handleEvent:(NSDictionary *)event;
 - (BOOL)goBack;
 // Optional adapter injection; production has no unverified player implementation.

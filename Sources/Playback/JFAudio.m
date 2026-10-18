@@ -40,9 +40,16 @@ NSArray *JFAudioTracks(NSArray *sources, NSError **error) {
 }
 NSDictionary *JFAudioDefaultTrack(NSArray *tracks) {
     if (![tracks isKindOfClass:[NSArray class]] || !tracks.count) return nil;
-    for (id track in tracks)
-        if ([track isKindOfClass:[NSDictionary class]] && [track[@"default"] boolValue]) return track;
-    return [tracks[0] isKindOfClass:[NSDictionary class]] ? tracks[0] : nil;
+    NSDictionary *firstCompatible=nil;
+    for (id track in tracks) {
+        if (![track isKindOfClass:[NSDictionary class]]) continue;
+        BOOL compatible=[track[@"codec"] isEqual:@"aac"] &&
+            [track[@"channels"] integerValue]>0 && [track[@"channels"] integerValue]<=2 &&
+            [track[@"sampleRate"] integerValue]>0 && [track[@"sampleRate"] integerValue]<=48000;
+        if (compatible && !firstCompatible) firstCompatible=track;
+        if (compatible && [track[@"default"] boolValue]) return track;
+    }
+    return firstCompatible ?: ([tracks[0] isKindOfClass:[NSDictionary class]] ? tracks[0] : nil);
 }
 NSString *JFAudioTrackLabel(NSDictionary *track) {
     if (![track isKindOfClass:[NSDictionary class]] || !JFMediaID(track[@"sourceID"]) || !JFTicks(track[@"index"]) ||

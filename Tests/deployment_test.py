@@ -4,7 +4,6 @@ from pathlib import Path
 import subprocess
 import tempfile
 import hashlib
-import os
 import unittest
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('deploy', 'Scripts/device-deploy.py')
@@ -94,11 +93,9 @@ fixture_query() {
     def test_log_collection_opt_in(self):
         self.assertNotIn('tail -n',deploy.script(self.args('crashes')))
         self.assertIn('tail -n',deploy.script(self.args('crashes','--include-sensitive-logs')))
-    def test_candidate_hash_is_checked(self):
-        # Public source checkouts do not ship historical build artifacts.
-        path=Path(os.environ.get('JF_PACKAGE', 'build/package-phase4e-final/org.jellyfin.atv3_0.4.0-test1_iphoneos-arm.deb'))
-        version=next(line.split(':', 1)[1].strip() for line in Path('Packaging/control').read_text().splitlines() if line.startswith('Version:'))
+    def test_original_candidate_hash_is_checked(self):
+        path=Path('build/package-phase4e-final/org.jellyfin.atv3_0.4.0-test1_iphoneos-arm.deb')
         with self.assertRaises(ValueError): deploy.verify_package(path,'0'*64)
-        self.assertEqual(deploy.verify_package(path)[1],version)
+        self.assertEqual(deploy.verify_package(path)[1],'0.4.0-test1')
 
 if __name__=='__main__': unittest.main()

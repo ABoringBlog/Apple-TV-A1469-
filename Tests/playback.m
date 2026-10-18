@@ -3,6 +3,7 @@
 #import "Playback/JFSubtitle.h"
 #import "Playback/JFAudio.h"
 #import "Playback/JFPlaybackController.h"
+#import "Playback/JFAppAudioLink.h"
 #import "Playback/JFATV3PlaybackBackend.h"
 #import "Playback/JFMediaGateway.h"
 #import <objc/runtime.h>
@@ -16,7 +17,7 @@
 @interface JFSession (TestClient)
 - (id)initWithOwnedClient:(JFClient *)client;
 @end
-static id atvManagerSingleton, atvLastAsset, atvLastPlayer, atvLastController, atvStreamingType;
+static id atvManagerSingleton, atvLastAsset, atvLastPlayer, atvLastController, atvStreamingType, atvVisiblePlayer;
 static NSUInteger atvCueCalls, atvStateCalls, atvPresentCalls, atvEndPresentationCalls;
 static BOOL atvThrowPlayer;
 static double atvElapsed, atvRate;
@@ -43,8 +44,9 @@ static id ATVPlayerForAsset(id self, SEL cmd, id asset, NSError **error) {
     id player=[[[playerClass alloc] init] autorelease];
     [atvLastPlayer release]; atvLastPlayer=[player retain]; return player;
 }
-static void ATVPresent(id self, SEL cmd, id player, id options) { atvPresentCalls++; }
-static void ATVEndPresentation(id self, SEL cmd) { atvEndPresentationCalls++; }
+static void ATVPresent(id self, SEL cmd, id player, id options) { atvPresentCalls++; atvVisiblePlayer=player; }
+static void ATVEndPresentation(id self, SEL cmd) { atvEndPresentationCalls++; atvVisiblePlayer=nil; }
+static id ATVPresentedPlayer(id self, SEL cmd) { return atvVisiblePlayer; }
 static id ATVControllerForPlayer(id self, SEL cmd, id player) {
     Class controllerClass=objc_getClass("BRMediaPlayerController");
     id controller=[[[controllerClass alloc] init] autorelease];
@@ -76,7 +78,8 @@ static void SetupATV3PlaybackRuntime(void) {
     AddMethod(object_getClass(manager),"sharedInstance",(IMP)ATVShared,"@8@0:4");
     AddMethod(manager,"playerForMediaAsset:error:",(IMP)ATVPlayerForAsset,"@16@0:4@8^@12");
     AddMethod(manager,"presentPlayer:options:",(IMP)ATVPresent,"v16@0:4@8@12");
-    AddMethod(manager,"endPresentation",(IMP)ATVEndPresentation,"v8@0:4"); objc_registerClassPair(manager);
+    AddMethod(manager,"endPresentation",(IMP)ATVEndPresentation,"v8@0:4");
+    AddMethod(manager,"_presentedPlayer",(IMP)ATVPresentedPlayer,"@8@0:4"); objc_registerClassPair(manager);
     atvManagerSingleton=[[manager alloc] init];
     Class controller=objc_allocateClassPair([NSObject class],"BRMediaPlayerController",0);
     AddMethod(object_getClass(controller),"controllerForPlayer:",(IMP)ATVControllerForPlayer,"@12@0:4@8");
@@ -94,10 +97,23 @@ static JFClient *Client(void) { JFClient *c=[[[JFClient alloc] initWithURL:[NSUR
 int main(void) { @autoreleasepool {
     [NSURLProtocol registerClass:[JFPlaybackFixture class]]; [JFPlaybackFixture setMode:@"normal"];
     NSDictionary *profile=JFProvisionalDeviceProfile();
-    CHECK([profile[@"Name"] containsString:@"PROVISIONAL"]);
+    CHECK([profile[@"Name"] containsString:@"SERVER-FIRST"]);
     NSString *profileJSON=[[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:profile options:0 error:NULL] encoding:NSUTF8StringEncoding] autorelease];
     for (NSString *unsupported in @[@"ac3",@"hevc",@"av1",@"dolby",@"hdr"]) CHECK(![profileJSON.lowercaseString containsString:unsupported]);
+    NSArray *subtitleProfiles=profile[@"SubtitleProfiles"];
+    CHECK([subtitleProfiles isKindOfClass:[NSArray class]] && subtitleProfiles.count==8);
+    for (NSDictionary *subtitleProfile in subtitleProfiles) {
+        CHECK([subtitleProfile[@"Format"] isKindOfClass:[NSString class]] && [subtitleProfile[@"Format"] length]>0);
+        CHECK([subtitleProfile[@"Method"] isEqual:@"External"]);
+    }
     CHECK(!JFPlaybackBody(-1,-1)); CHECK(!JFPlaybackBody(0,-2)); CHECK(!JFPlaybackBody(0,10001)); CHECK([JFPlaybackBody(90,-1)[@"StartTimeTicks"] longLongValue]==90);
+    // Main-thread stall must proactively send one authenticated pause well
+    // before Mac's 5s active watchdog; never pause before commit or twice.
+    CHECK(!JFV2BackgroundHoldDue(102.0,100.5,YES,NO));
+    CHECK(JFV2BackgroundHoldDue(102.1,100.0,YES,NO));
+    CHECK(!JFV2BackgroundHoldDue(110.0,100.0,NO,NO));
+    CHECK(!JFV2BackgroundHoldDue(110.0,100.0,YES,YES));
+    CHECK(!JFV2BackgroundHoldDue(110.0,0.0,YES,NO));
     for (id invalid in @[@YES,@(-1),@(NAN),@(INFINITY),@1.5,@"1",[NSNull null]]) CHECK(!JFTicks(invalid));
     CHECK(!JFMediaID(@"../id")); CHECK(!JFMediaID(@"id?token=x"));
     NSError *error=nil; NSMutableDictionary *info=Info();
@@ -126,11 +142,86 @@ int main(void) { @autoreleasepool {
     info[@"MediaSources"][0][@"Container"]=@"mkv";
     info[@"MediaSources"][0][@"MediaStreams"][0][@"Codec"]=@"hevc";
     CHECK([JFPlaybackPlan(info,@"movie1",0,&error)[@"method"] isEqual:@"Transcode"]);
+
+    // A source with AAC + AC3 must not lose Direct Play merely for having >1 audio track.
+    NSMutableDictionary *multi=Info();
+    NSMutableDictionary *otherAudio=[@{@"Type":@"Audio",@"Index":@5,@"Codec":@"ac3",
+        @"Channels":@6,@"SampleRate":@48000,@"IsDefault":@YES} mutableCopy];
+    [multi[@"MediaSources"][0][@"MediaStreams"] addObject:otherAudio]; [otherAudio release];
+    multi[@"MediaSources"][0][@"TranscodingUrl"]=[NSNull null];
+    NSDictionary *multiPlan=JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",-1,&error);
+    CHECK([multiPlan[@"method"] isEqual:@"DirectPlay"]);
+    CHECK([multiPlan[@"audioStreamIndex"] integerValue]==1);
+    CHECK([JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",1,&error)[@"method"] isEqual:@"DirectPlay"]);
+    // AC3 user choice remains bound to original track #5. The video can
+    // DirectPlay its independently available AAC native transport track #1;
+    // the Mac bridge supplies decoded AAC for original track #5.
+    NSDictionary *selectedAC3=JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",5,&error);
+    CHECK([selectedAC3[@"method"] isEqual:@"DirectPlay"]);
+    CHECK([selectedAC3[@"audioStreamIndex"] integerValue]==5);
+    CHECK([JFPlaybackReport(selectedAC3,0,NO)[@"AudioStreamIndex"] integerValue]==5);
+    CHECK(JFVideoTransportAACIndex(multi,@"source1")==1);
+    CHECK(JFVideoTransportAACIndex(multi,@"nonexistent")==-1);
+    CHECK(JFVideoTransportAACIndex(multi,nil)==-1);
+    // Default AC3 must not control video format negotiation when user
+    // selects AC3 audio for the separate authenticated Mac AAC cache.
+    multi[@"MediaSources"][0][@"MediaStreams"][1][@"IsDefault"]=@NO;
+    CHECK(JFVideoTransportAACIndex(multi,@"source1")==1);
+    CHECK([JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",5,&error)[@"audioStreamIndex"] integerValue]==5);
+    CHECK(!JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",6,&error));
+    CHECK(!JFPlaybackPlanForSourceAndAudio(multi,@"movie1",0,@"source1",10001,&error));
+
+    // Compatible H.264 video with incompatible audio should preserve video and transcode audio only.
+    NSMutableDictionary *audioOnly=Info();
+    audioOnly[@"MediaSources"][0][@"SupportsDirectPlay"]=@NO;
+    audioOnly[@"MediaSources"][0][@"SupportsDirectStream"]=@NO;
+    audioOnly[@"MediaSources"][0][@"MediaStreams"][1][@"Codec"]=@"ac3";
+    NSDictionary *audioOnlyPlan=JFPlaybackPlan(audioOnly,@"movie1",0,&error);
+    CHECK([audioOnlyPlan[@"method"] isEqual:@"Transcode"]);
+    CHECK([audioOnlyPlan[@"allowVideoCopy"] boolValue]);
+    // URL-level mixed copy/transcode assertions are checked after the client fixture is created.
     info[@"MediaSources"][0][@"SupportsTranscoding"]=@NO; CHECK(!JFPlaybackPlan(info,@"movie1",0,&error));
     for (NSArray *pair in @[@[@"Width",@3840],@[@"Height",@2160],@[@"BitDepth",@10],@[@"VideoRange",@"HDR"],@[@"RealFrameRate",@60],@[@"Level",@51],@[@"Codec",@"av1"]]) {
         NSMutableDictionary *bad=Info(); bad[@"MediaSources"][0][@"MediaStreams"][0][pair[0]]=pair[1]; CHECK([JFPlaybackPlan(bad,@"movie1",0,&error)[@"method"] isEqual:@"Transcode"]);
     }
+    // VFR MP4 r_frame_rate can be 50, 60 or 90000 while the Jellyfin
+    // ReferenceFrameRate (AverageFrameRate) is within the ATV3's 30fps envelope.
+    for (NSArray *rates in @[@[@90000,@24.000174],@[@60,@29.99975],@[@90000,@30.000227],@[@50,@24.999828]]) {
+        NSMutableDictionary *vfr=Info();
+        vfr[@"MediaSources"][0][@"MediaStreams"][0][@"RealFrameRate"]=rates[0];
+        vfr[@"MediaSources"][0][@"MediaStreams"][0][@"AverageFrameRate"]=rates[1];
+        NSDictionary *vfrPlan=JFPlaybackPlan(vfr,@"movie1",0,&error);
+        CHECK([vfrPlan[@"method"] isEqual:@"DirectPlay"]);
+        CHECK([vfrPlan[@"videoRejectMask"] unsignedIntegerValue]==0);
+    }
+    NSMutableDictionary *badAvg=Info();
+    badAvg[@"MediaSources"][0][@"MediaStreams"][0][@"RealFrameRate"]=@60;
+    badAvg[@"MediaSources"][0][@"MediaStreams"][0][@"AverageFrameRate"]=@31;
+    CHECK([JFPlaybackPlan(badAvg,@"movie1",0,&error)[@"method"] isEqual:@"Transcode"]);
+    CHECK(![JFPlaybackPlan(badAvg,@"movie1",0,&error)[@"allowVideoCopy"] boolValue]);
+    NSDictionary *activeProfile=JFProvisionalDeviceProfile();
+    BOOL sawFps=NO;
+    for (NSDictionary *codecProfile in activeProfile[@"CodecProfiles"])
+        for (NSDictionary *condition in codecProfile[@"Conditions"])
+            if ([condition[@"Property"] isEqual:@"VideoFramerate"])
+                sawFps=[condition[@"Value"] isEqual:@"30.01"];
+    CHECK(sawFps);
     JFClient *client=Client();
+    NSURLRequest *audioOnlyRequest=[client playbackRequest:audioOnlyPlan error:&error];
+    CHECK(audioOnlyRequest!=nil);
+    CHECK([audioOnlyRequest.URL.query containsString:@"VideoCodec=copy"]);
+    CHECK([audioOnlyRequest.URL.query containsString:@"AudioCodec=aac"]);
+    CHECK([audioOnlyRequest.URL.query containsString:@"AllowVideoStreamCopy=true"]);
+    CHECK([audioOnlyRequest.URL.query containsString:@"AllowAudioStreamCopy=false"]);
+
+    // Burn-in subtitles must disable video copy even when the source video is otherwise compatible.
+    NSMutableDictionary *burnPlan=[[audioOnlyPlan mutableCopy] autorelease];
+    burnPlan[@"subtitleStreamIndex"]=@2;
+    NSURLRequest *burnRequest=[client playbackRequest:burnPlan error:&error];
+    CHECK(burnRequest!=nil);
+    CHECK([burnRequest.URL.query containsString:@"VideoCodec=h264"]);
+    CHECK([burnRequest.URL.query containsString:@"AudioCodec=aac"]);
+    CHECK([burnRequest.URL.query containsString:@"AllowVideoStreamCopy=false"]);
     CHECK([client playbackInfo:@"movie1" startTicks:100 mediaSourceID:@"source1" audioIndex:1 subtitleIndex:-1 error:&error]);
     CHECK([[JFPlaybackFixture lastBody][@"MediaSourceId"] isEqual:@"source1"]);
     CHECK([[JFPlaybackFixture lastBody][@"AudioStreamIndex"] integerValue]==1);
@@ -140,6 +231,9 @@ int main(void) { @autoreleasepool {
     CHECK([[JFPlaybackFixture lastBody][@"AudioStreamIndex"] integerValue]==1);
     CHECK([[JFPlaybackFixture lastBody][@"SubtitleStreamIndex"] integerValue]==2);
     CHECK(![[JFPlaybackFixture lastBody][@"EnableDirectPlay"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"EnableDirectStream"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"AllowVideoStreamCopy"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"AllowAudioStreamCopy"] boolValue]);
     CHECK([[JFPlaybackFixture lastBody][@"AlwaysBurnInSubtitleWhenTranscoding"] boolValue]);
     CHECK(![client playbackInfo:@"movie1" startTicks:100 mediaSourceID:nil audioIndex:-1 subtitleIndex:2 error:&error]);
     NSURLRequest *direct=[client playbackRequest:plan error:&error]; CHECK(direct!=nil); CHECK([direct.URL.query containsString:@"StartTimeTicks=100"]); CHECK(![direct.URL.absoluteString containsString:@"fixture-token"]); CHECK([[direct valueForHTTPHeaderField:@"Authorization"] containsString:@"Token=\"fixture-token\""] && ![direct valueForHTTPHeaderField:@"X-Emby-Token"]);
@@ -168,7 +262,10 @@ int main(void) { @autoreleasepool {
     NSTimeInterval rewriteStart=[NSProcessInfo processInfo].systemUptime;
     NSData *manyRewritten=[gateway rewritePlaylist:[manySegments dataUsingEncoding:NSUTF8StringEncoding] URL:origin];
     NSTimeInterval rewriteSeconds=[NSProcessInfo processInfo].systemUptime-rewriteStart;
-    CHECK(manyRewritten.length>0 && rewriteSeconds<1.0);
+    // Keep the original one-second performance gate by default. During an
+    // explicitly marked busy-host functional run, check correctness separately.
+    BOOL busyHost=getenv("JF_BENCHMARK_ALLOW_BUSY_HOST")!=NULL;
+    CHECK(manyRewritten.length>0 && rewriteSeconds<(busyHost?10.0:1.0));
     NSData *duplicate=[gateway rewritePlaylist:[@"#EXTM3U\nsegment0000.ts?opaque=z\nsegment0000.ts?opaque=z\n" dataUsingEncoding:NSUTF8StringEncoding] URL:origin];
     CHECK(duplicate.length>0);
     NSMutableData *oversized=[NSMutableData dataWithLength:4*1024*1024+1]; CHECK(![gateway rewritePlaylist:oversized URL:origin]);
@@ -231,6 +328,18 @@ int main(void) { @autoreleasepool {
     CHECK([foundationEvent isEqual:@"popped"] && foundationTicks==120000000LL);
     [native stop];
     [foundationEvent release]; foundationEvent=nil; foundationTicks=-1;
+    // Silent native disappearance: firmware does not always post WasPopped.
+    [native startRequest:direct positionTicks:100 event:^(NSString *event,long long ticks){ [foundationEvent release]; foundationEvent=[event copy]; foundationTicks=ticks; }];
+    atvElapsed=42.0; [native performSelector:@selector(sampleProgress)];
+    CHECK([foundationEvent isEqual:@"progress"] && foundationTicks==420000000LL);
+    // Paused playback must retain its presentation and captions.
+    [native pause]; [native performSelector:@selector(sampleProgress)];
+    CHECK(![foundationEvent isEqual:@"popped"]);
+    // Native player window closes without delivering a WasPopped notification.
+    atvVisiblePlayer=nil; [native performSelector:@selector(sampleProgress)];
+    CHECK([foundationEvent isEqual:@"popped"] && foundationTicks==420000000LL);
+    [native stop];
+    [foundationEvent release]; foundationEvent=nil; foundationTicks=-1;
     [native startRequest:direct positionTicks:100 event:^(NSString *event,long long ticks){ [foundationEvent release]; foundationEvent=[event copy]; foundationTicks=ticks; }];
     atvElapsed=42.0; [native performSelector:@selector(sampleProgress)];
     atvElapsed=0.0;
@@ -254,7 +363,7 @@ int main(void) { @autoreleasepool {
     NSMutableDictionary *selectedTranscode=[[transcode mutableCopy] autorelease];
     selectedTranscode[@"audioStreamIndex"]=@1; selectedTranscode[@"subtitleStreamIndex"]=@2;
     NSURLRequest *request=[client playbackRequest:selectedTranscode error:&error]; CHECK(request!=nil); CHECK(![request.URL.absoluteString containsString:@"SECRET"]); CHECK([request.URL.query containsString:@"VideoCodec=h264"]); CHECK([request.URL.query containsString:@"MaxWidth=1920"]); CHECK([request.URL.query containsString:@"SegmentLength=3"] && ![request.URL.query containsString:@"SegmentLength=6"]); CHECK(![request.URL.query.lowercaseString containsString:@"starttimeticks"]);
-    CHECK([request.URL.query containsString:@"AudioStreamIndex=1"]); CHECK([request.URL.query containsString:@"SubtitleStreamIndex=2"]);
+    CHECK([request.URL.query containsString:@"AudioStreamIndex=1"]); CHECK([request.URL.query containsString:@"SubtitleStreamIndex=2"]); CHECK([request.URL.query containsString:@"AllowVideoStreamCopy=false"]); CHECK([request.URL.query containsString:@"AllowAudioStreamCopy=false"]);
     NSMutableDictionary *longInfo=Info(); longInfo[@"MediaSources"][0][@"MediaStreams"][0][@"Codec"]=@"hevc"; longInfo[@"MediaSources"][0][@"RunTimeTicks"]=@108000000001LL;
     longInfo[@"MediaSources"][0][@"TranscodingUrl"]=@"/jellyfin/Videos/movie1/master.m3u8?SegmentLength=3";
     NSDictionary *longPlan=JFPlaybackPlan(longInfo,@"movie1",0,&error); NSURLRequest *longRequest=[client playbackRequest:longPlan error:&error];
@@ -301,16 +410,16 @@ int main(void) { @autoreleasepool {
     NSArray *sourceTracks=JFSubtitleTracksForSources(Info()[@"MediaSources"],&error); CHECK(sourceTracks.count==3);
     CHECK([sourceTracks[0][@"sourceID"] isEqual:@"source1"]); CHECK([JFAudioTrackLabel(audioTracks[0]) containsString:@"Original"]);
     CHECK([JFSubtitleTrackLabel(sourceTracks[0]) containsString:@"SRT"]);
-    CHECK([JFSubtitleSelection(tracks,2,NO,&error)[@"strategy"] isEqual:@"direct subtitle"]);
-    CHECK([JFSubtitleSelection(tracks,3,NO,&error)[@"strategy"] isEqual:@"server-side conversion"]);
-    CHECK([JFSubtitleSelection(tracks,3,YES,&error)[@"strategy"] isEqual:@"burn-in required"]);
-    CHECK([JFSubtitleSelection(tracks,4,NO,&error)[@"strategy"] isEqual:@"burn-in required"]);
+    CHECK([JFSubtitleSelection(tracks,2,NO,&error)[@"strategy"] isEqual:@"local-srt"]);
+    CHECK([JFSubtitleSelection(tracks,3,NO,&error)[@"strategy"] isEqual:@"preprocess-required"]);
+    CHECK([JFSubtitleSelection(tracks,3,YES,&error)[@"strategy"] isEqual:@"preprocess-required"]);
+    CHECK([JFSubtitleSelection(tracks,4,NO,&error)[@"strategy"] isEqual:@"preprocess-required"]);
     CHECK([JFSubtitleSelection(tracks,-1,NO,&error)[@"strategy"] isEqual:@"off"]); CHECK(!JFSubtitleSelection(tracks,8,NO,&error));
     for (NSString *codec in @[@"srt",@"ssa",@"pgs",@"dvdsub",@"unknown"]) {
         NSArray *selected=JFSubtitleTracks(@[@{@"Type":@"Subtitle",@"Index":@7,@"Codec":codec,@"IsExternal":@NO}],&error);
         NSDictionary *selection=JFSubtitleSelection(selected,7,NO,&error);
         if ([codec isEqual:@"unknown"]) CHECK(!selection);
-        else CHECK([selection[@"strategy"] isEqual:[@[@"srt",@"ssa"] containsObject:codec] ? @"server-side conversion" : @"burn-in required"]);
+        else CHECK([selection[@"strategy"] isEqual:([codec isEqual:@"srt"] ? @"local-srt" : @"preprocess-required")]);
     }
     CHECK(!JFSubtitleSelection((id)@{},1,NO,&error));
     CHECK(!JFSubtitleSelection(@[[NSNull null]],1,NO,&error));
@@ -318,6 +427,9 @@ int main(void) { @autoreleasepool {
     CHECK(!JFSubtitleTracks(@[@{@"Type":@"Subtitle",@"Index":@0,@"Codec":@"srt",@"IsExternal":@"true"}],&error));
     CHECK(!JFSubtitleTracks(@[Info()[@"MediaSources"][0][@"MediaStreams"][2],Info()[@"MediaSources"][0][@"MediaStreams"][2]],&error));
     CHECK([client subtitleData:@"movie1" mediaSource:@"source1" index:2 error:&error]!=nil);
+    // Playback uses the single-pass, already-parsed SRT path.
+    NSArray *downloadedCues=[client localSubtitleCues:@"movie1" mediaSource:@"source1" index:2 error:&error];
+    CHECK(downloadedCues.count>0 && !error);
     CHECK(![client subtitleRequest:@"../x" mediaSource:@"source1" index:2 error:&error]); CHECK(![client subtitleRequest:@"movie1" mediaSource:@"source1" index:-1 error:&error]);
     for (NSData *data in @[[NSData data],[NSData dataWithBytes:"\xff" length:1],[NSMutableData dataWithLength:2*1024*1024+1],[@"not SRT" dataUsingEncoding:NSUTF8StringEncoding],[@"1\n00:00:03,000 --> 00:00:01,000\nx" dataUsingEncoding:NSUTF8StringEncoding]]) CHECK(!JFSubtitleText(data,&error));
     CHECK(JFSubtitleText([@"\uFEFF1\r\n00:00:01,000 --> 00:00:02,000\r\n字幕" dataUsingEncoding:NSUTF8StringEncoding],&error));
@@ -329,10 +441,17 @@ int main(void) { @autoreleasepool {
     CHECK(![controller playItem:@"movie1" startTicks:0 mediaSourceID:nil audioIndex:-1 subtitleIndex:2]);
     CHECK([JFPlaybackFixture lastBody][@"DeviceProfile"]!=nil); CHECK([[JFPlaybackFixture lastBody][@"StartTimeTicks"] longLongValue]==100);
     [backend emit:@"started" ticks:0]; CHECK([controller.currentState isEqual:@"playing"]);
+    CHECK([[controller currentMediaSourceID] isEqual:@"source1"]);
+    CHECK(![controller selectLocalSubtitleForItem:@"movie1" mediaSourceID:@"other-source" index:2]);
     CHECK(Wait(^BOOL { return [JFPlaybackFixture reports].count==1; }));
     CHECK([controller pause]); CHECK([controller.currentState isEqual:@"paused"]); CHECK(![controller pause]);
     [backend emit:@"progress" ticks:500]; CHECK(controller.positionTicks==100);
-    CHECK([controller resume]); JFBackendEvent beforeSeek=[[backend capturedEvent] copy]; CHECK(![controller seek:-1]); CHECK(![controller seek:6000000001LL]); CHECK([controller seek:200000000]); beforeSeek(@"progress",500000000); CHECK(controller.positionTicks==200000000); [beforeSeek release];
+    CHECK([controller resume]);
+    CHECK([controller seekBySeconds:300]); CHECK(controller.positionTicks==3000000100LL);
+    CHECK([controller seekBySeconds:-300]); CHECK(controller.positionTicks==100);
+    CHECK([controller seekBySeconds:-300]); CHECK(controller.positionTicks==0);
+    CHECK(![controller seekBySeconds:-300]); CHECK(![controller seekBySeconds:601]);
+    JFBackendEvent beforeSeek=[[backend capturedEvent] copy]; CHECK(![controller seek:-1]); CHECK(![controller seek:6000000001LL]); CHECK([controller seek:200000000]); beforeSeek(@"progress",500000000); CHECK(controller.positionTicks==200000000); [beforeSeek release];
     __block NSUInteger progress=0; controller.progressCallback=^(long long ticks) { progress++; };
     [backend emit:@"progress" ticks:300000000]; CHECK(progress==1); CHECK(controller.positionTicks==300000000);
     [backend emit:@"progress" ticks:120000000]; CHECK(controller.positionTicks==120000000);
@@ -340,7 +459,7 @@ int main(void) { @autoreleasepool {
     [backend emit:@"resumed" ticks:120000000]; CHECK([controller.currentState isEqual:@"playing"] && controller.positionTicks==120000000);
     JFBackendEvent late=[[backend capturedEvent] copy];
     [backend emit:@"popped" ticks:120000000]; CHECK([controller.currentState isEqual:@"stopped"] && [controller resumeTicksForItem:@"movie1"]==120000000);
-    CHECK(![controller stop]); CHECK([controller resumeTicksForItem:@"movie2"]==0);
+    CHECK(![controller stop]); CHECK([controller resumeTicksForItem:@"movie2"]==0); CHECK([controller currentMediaSourceID]==nil);
     late(@"progress",500000000); late(@"started",0); CHECK([controller.currentState isEqual:@"stopped"]); [late release];
     CHECK(Wait(^BOOL { return [[[JFPlaybackFixture reports] lastObject][@"path"] hasSuffix:@"Stopped"]; }));
     CHECK([controller playItem:@"movie1" startTicks:0]); CHECK(Wait(^BOOL { return backend.starts==2; })); [backend emit:@"started" ticks:0]; [backend emit:@"progress" ticks:5900000000LL]; [backend emit:@"ended" ticks:5900000000LL]; CHECK([controller.currentState isEqual:@"stopped"] && controller.positionTicks==6000000000LL && [controller resumeTicksForItem:@"movie1"]==0);

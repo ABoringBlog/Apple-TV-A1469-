@@ -65,7 +65,7 @@ BOOL JFBRMenuClassAvailable(Class cls) {
 }
 @implementation JFBRMenu
 - (id)initWithController:(id)controller {
-    if ((self=[super init])) { _controller=controller; _rows=[@[@{@"title":@"RetroReel3",@"enabled":@NO}] copy]; _title=[@"RetroReel3" copy]; }
+    if ((self=[super init])) { _controller=controller; _rows=[@[@{@"title":@"Jellyfin",@"enabled":@NO}] copy]; _title=[@"Jellyfin" copy]; }
     return self;
 }
 - (BOOL)canRender {
@@ -106,7 +106,7 @@ BOOL JFBRMenuClassAvailable(Class cls) {
 - (void)close {
     if (_closed) return;
     [self deactivate]; _closed=YES; _controller=nil;
-    [_rows release]; _rows=[@[] copy]; [_title release]; _title=[@"RetroReel3" copy]; _selection=0;
+    [_rows release]; _rows=[@[] copy]; [_title release]; _title=[@"Jellyfin" copy]; _selection=0;
 }
 - (void)displayTitle:(NSString *)title rows:(NSArray *)rows selection:(long)selection {
     if (_closed) return;

@@ -1,4 +1,5 @@
 #import "JFATV3PlaybackBackend.h"
+#import "JFAppAudioLink.h"
 #import "JFMediaGateway.h"
 #import "JFPlaybackTrace.h"
 #import <objc/runtime.h>
@@ -60,7 +61,7 @@ static id JFAssetID(id self, SEL cmd) {
 }
 static id JFAssetTitle(id self, SEL cmd) {
     NSString *title=[[[JFAssetRequest(self) URL] lastPathComponent] stringByRemovingPercentEncoding];
-    return title.length ? title : @"RetroReel3";
+    return title.length ? title : @"Jellyfin";
 }
 static id JFAssetMediaType(id self, SEL cmd) {
     Class mediaType=objc_getClass("BRMediaType");
@@ -117,6 +118,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
 - (void)removeObservers;
 - (void)nativeNotification:(NSNotification *)notification;
 - (void)sampleProgress;
+- (BOOL)detectNativePresentationExit;
 - (void)checkNativeRate;
 - (long long)currentTicks;
 - (void)emit:(NSString *)event ticks:(long long)ticks;
@@ -247,14 +249,61 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     if (callback) callback(event,ticks);
     [callback release];
 }
+- (BOOL)detectNativePresentationExit {
+    // 12H1006 publishes _presentedPlayer even when its WasPopped notification
+    // is absent. Only trust a transition after observing this exact player
+    // presented at least once, so initial asynchronous setup cannot abort play.
+    if (!_presented || !_started || _stopping || !_player) return NO;
+    id manager=JFATV3Object(objc_getClass("BRMediaPlayerManager"),@"sharedInstance");
+    if (!manager || !JFATV3Signature(manager,NSSelectorFromString(@"_presentedPlayer"),@encode(id),@[])) return NO;
+    id current=JFATV3Object(manager,@"_presentedPlayer");
+    if (current==_player) { _verifiedNativePresentation=YES; return NO; }
+    if (!_verifiedNativePresentation) return NO;
+    long long ticks=[self currentTicks];
+    if (ticks>0) _lastTicks=ticks;
+    JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_PRESENTATION_GONE ticks=%lld",_lastTicks]);
+    _presented=NO; _started=NO; _nativePaused=NO; _verifiedNativePresentation=NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self];
+    [self emit:@"popped" ticks:_lastTicks];
+    return YES;
+}
 - (void)sampleProgress {
     if (!_started || _stopping || !_player) return;
+    if ([self detectNativePresentationExit]) return;
     long long ticks=[self currentTicks];
+    NSTimeInterval now=[NSProcessInfo processInfo].systemUptime;
     if (ticks==0 && _lastTicks>10000000LL) {
-        JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_POSITION_IGNORE sampled=0 retained=%lld",_lastTicks]);
+        if (!_zeroPositionActive) {
+            _zeroPositionActive=YES; _zeroPositionSince=now;
+            JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_STALL begin retained=%lld",_lastTicks]);
+        }
     } else {
+        if (_zeroPositionActive) {
+            NSUInteger stallMillis=(NSUInteger)MAX(0,(now-_zeroPositionSince)*1000.0);
+            JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_STALL end ms=%lu sampled=%lld",(unsigned long)stallMillis,ticks]);
+            _zeroPositionActive=NO;
+        }
         if (ticks<_lastTicks) JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_POSITION_BACKWARD from=%lld to=%lld",_lastTicks,ticks]);
         _lastTicks=ticks;
+        const long long readyDelta=2000000LL; // 0.2 s of real timeline advance.
+        long long startDelta=ticks>=_startBaselineTicks ? ticks-_startBaselineTicks : _startBaselineTicks-ticks;
+        if (_startProgressPending && startDelta>=readyDelta) {
+            NSUInteger ms=(NSUInteger)MAX(0,(now-_startRequestedAt)*1000.0);
+            JFPlaybackTrace([NSString stringWithFormat:@"PLAY_PROGRESS_READY ms=%lu ticks=%lld",(unsigned long)ms,ticks]);
+            _startProgressPending=NO;
+        }
+        long long resumeDelta=ticks>=_resumeBaselineTicks ? ticks-_resumeBaselineTicks : _resumeBaselineTicks-ticks;
+        if (_resumeProgressPending && resumeDelta>=readyDelta) {
+            NSUInteger ms=(NSUInteger)MAX(0,(now-_resumeRequestedAt)*1000.0);
+            JFPlaybackTrace([NSString stringWithFormat:@"RESUME_PROGRESS_READY ms=%lu ticks=%lld",(unsigned long)ms,ticks]);
+            _resumeProgressPending=NO;
+        }
+        long long seekDelta=ticks>=_seekBaselineTicks ? ticks-_seekBaselineTicks : _seekBaselineTicks-ticks;
+        if (_seekProgressPending && seekDelta>=readyDelta) {
+            NSUInteger ms=(NSUInteger)MAX(0,(now-_seekRequestedAt)*1000.0);
+            JFPlaybackTrace([NSString stringWithFormat:@"SEEK_PROGRESS_READY ms=%lu target=%lld ticks=%lld",(unsigned long)ms,_seekBaselineTicks,ticks]);
+            _seekProgressPending=NO;
+        }
         [self emit:@"progress" ticks:ticks];
     }
     if (_started && !_stopping)
@@ -262,6 +311,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
 }
 - (void)checkNativeRate {
     if (!_started || _stopping || !_player || [NSProcessInfo processInfo].systemUptime<_ignoreNativeRateUntil) return;
+    if ([self detectNativePresentationExit]) return;
     @try {
         double rate=((double(*)(id,SEL))objc_msgSend)(_player,NSSelectorFromString(@"rate"));
         long long sampled=[self currentTicks];
@@ -337,12 +387,20 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
 }
 
 - (void)startRequest:(NSURLRequest *)request positionTicks:(long long)ticks event:(JFBackendEvent)event {
+    [self startRequest:request positionTicks:ticks audioPlan:nil event:event];
+}
+- (void)startRequest:(NSURLRequest *)request positionTicks:(long long)ticks
+          audioPlan:(NSDictionary *)audioPlan event:(JFBackendEvent)event {
     if (![NSThread isMainThread] || !event) {
         JFPlaybackTrace(@"BACKEND_START rejected");
         if (event) event(@"failure",ticks);
         return;
     }
     [self stop];
+    _startRequestedAt=[NSProcessInfo processInfo].systemUptime;
+    _startBaselineTicks=ticks;
+    _startProgressPending=YES; _resumeProgressPending=NO; _seekProgressPending=NO;
+    JFPlaybackTrace([NSString stringWithFormat:@"PLAY_REQUEST ticks=%lld",ticks]);
     JFMediaGateway *gateway=[[JFMediaGateway alloc] initWithRequest:request];
     NSError *error=nil;
     if (!gateway || ![gateway start:&error]) {
@@ -379,9 +437,45 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
         JFPlaybackTrace(@"NATIVE_PRESENT begin");
         ((void(*)(id,SEL,id,id))objc_msgSend)(manager,NSSelectorFromString(@"presentPlayer:options:"),_player,nil);
         _presented=YES;
+        _verifiedNativePresentation=NO;
+        // This getter is firmware-verified. Observe the current player before
+        // it can be dismissed so exit cleanup doesn't depend on WasPopped.
+        [self detectNativePresentationExit];
         JFPlaybackTrace(@"NATIVE_PRESENT ok=1");
+        if (audioPlan && [audioPlan[@"audioStreamIndex"] isKindOfClass:[NSNumber class]]) {
+            // Explicitly park native playback, even if the presentation layer
+            // would otherwise start rendering on this firmware.
+            NSError *parkError=nil;
+            BOOL parked=((BOOL(*)(id,SEL,int,NSError **))objc_msgSend)(_player,
+                NSSelectorFromString(@"setState:error:"),1,&parkError);
+            JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_HELD_PARK ok=%d code=%ld",parked,(long)parkError.code]);
+            if (!parked) { [self failCurrentAtTicks:ticks];return; }
+            // Native player is cued and presented but NOT started. Mac must
+            // complete signed start + signed commit before video can move.
+            __block JFATV3PlaybackBackend *target=self;
+            BOOL bound=[JFAppAudioLink startHeldPlayer:_player plan:audioPlan ticks:ticks ready:^{
+                if (!target->_gateway || !target->_player || target->_stopping || target->_started)return;
+                JFPlaybackTrace(@"NATIVE_VIDEO_RELEASE_AFTER_MAC_COMMIT");
+                [target finishHeldNativeStartAtTicks:ticks];
+            } failure:^{
+                if (!target->_gateway || target->_stopping || target->_started)return;
+                JFPlaybackTrace(@"NATIVE_HELD_AUDIO_SETUP_FAILED");
+                [target failCurrentAtTicks:ticks];
+            }];
+            if (!bound) {JFPlaybackTrace(@"NATIVE_HELD_AUDIO_BIND_FAILED");[self failCurrentAtTicks:ticks];}
+            return;
+        }
+        [self finishHeldNativeStartAtTicks:ticks];
+    } @catch (NSException *exception) {
+        JFPlaybackTrace(@"BACKEND_EXCEPTION stage=start");
+        [self failCurrentAtTicks:ticks];
+    }
+}
+- (void)finishHeldNativeStartAtTicks:(long long)ticks {
+    if (![NSThread isMainThread] || !_player || !_gateway || _stopping || _started)return;
+    @try {
         _ignoreNativeRateUntil=[NSProcessInfo processInfo].systemUptime+1.0;
-        error=nil;
+        NSError *error=nil;
         BOOL playing=((BOOL(*)(id,SEL,int,NSError **))objc_msgSend)(_player,NSSelectorFromString(@"setState:error:"),3,&error);
         JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_PLAY ok=%d code=%ld",playing,(long)error.code]);
         if (!playing) { [self failCurrentAtTicks:ticks]; return; }
@@ -415,8 +509,13 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     @try {
         _ignoreNativeRateUntil=[NSProcessInfo processInfo].systemUptime+1.0;
         NSError *error=nil;
+        long long baseline=[self currentTicks];
+        _resumeRequestedAt=[NSProcessInfo processInfo].systemUptime;
+        _resumeBaselineTicks=baseline;
+        _resumeProgressPending=YES;
+        JFPlaybackTrace([NSString stringWithFormat:@"RESUME_REQUEST ticks=%lld",baseline]);
         BOOL ok=((BOOL(*)(id,SEL,int,NSError **))objc_msgSend)(_player,NSSelectorFromString(@"setState:error:"),3,&error);
-        if (!ok) { [self failCurrentAtTicks:_lastTicks]; return; }
+        if (!ok) { _resumeProgressPending=NO; [self failCurrentAtTicks:_lastTicks]; return; }
         _nativePaused=NO;
     } @catch (NSException *exception) { [self failCurrentAtTicks:_lastTicks]; }
 }
@@ -428,6 +527,10 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     [_event release]; _event=[event copy];
     @try {
         double seconds=(double)ticks/10000000.0;
+        _seekRequestedAt=[NSProcessInfo processInfo].systemUptime;
+        _seekBaselineTicks=ticks;
+        _seekProgressPending=!_nativePaused;
+        JFPlaybackTrace([NSString stringWithFormat:@"SEEK_REQUEST target=%lld paused=%d",ticks,_nativePaused]);
         ((void(*)(id,SEL,double))objc_msgSend)(_player,NSSelectorFromString(@"setElapsedTime:"),seconds);
         _lastTicks=ticks; _positionTicks=ticks;
     } @catch (NSException *exception) {
@@ -448,7 +551,9 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
             if (manager) ((void(*)(id,SEL))objc_msgSend)(manager,NSSelectorFromString(@"endPresentation"));
         }
     } @catch (NSException *exception) {}
-    _presented=NO;
+    _presented=NO; _verifiedNativePresentation=NO;
+    _startProgressPending=_resumeProgressPending=_seekProgressPending=NO;
+    _zeroPositionActive=NO; _zeroPositionSince=0;
     [self discardPreparedPlayback];
     _stopping=NO;
 }
@@ -461,7 +566,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     [_player release]; _player=nil;
     [_playerController release]; _playerController=nil;
     [_event release]; _event=nil;
-    _positionTicks=0; _lastTicks=0; _presented=NO; _started=NO; _nativePaused=NO;
+    _positionTicks=0; _lastTicks=0; _presented=NO; _started=NO; _nativePaused=NO; _verifiedNativePresentation=NO;
     _ignoreNativeRateUntil=0;
 }
 - (void)dealloc {

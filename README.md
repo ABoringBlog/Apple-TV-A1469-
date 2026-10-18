@@ -12,7 +12,7 @@ Independent open-source applications for **jailbroken Apple TV 3 (A1469 / AppleT
 
 | App | Description / 功能 | Release |
 | --- | --- | --- |
-| **[RetroReel3](#retroreel3-jellyfin-client)** | Independent, unofficial native client for Jellyfin / 非官方 Jellyfin 原生客户端 | [v0.5.85-brand1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.85-brand1) |
+| **[RetroReel3](#retroreel3-jellyfin-client)** | Independent, unofficial native client for Jellyfin / 非官方 Jellyfin 原生客户端 | [v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1) |
 | **[Clock](Clock/)** | Native standalone clock / 原生独立时钟 | [clock-v0.1.5](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/clock-v0.1.5) |
 | **[Weather](Weather/)** | Native weather, English + 中文; requires Mac ATV3Bridge 24/7 / 原生天气，依赖 Mac 24 小时桥接 | [weather-v1.0.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/weather-v1.0.0-public2) |
 | **[Radio](Radio/)** | Native Internet Radio, English + 中文; requires Mac ATV3Bridge Radio / 原生网络电台，依赖 Mac Bridge | [radio-v0.3.1-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/radio-v0.3.1-public2) |
@@ -34,6 +34,8 @@ Independent open-source applications for **jailbroken Apple TV 3 (A1469 / AppleT
 
 ## RetroReel3 (Jellyfin client)
 
+**Current ATV3 Jellyfin release: v0.5.101-public1.** Newly verified user-facing work includes progressive 10-item library first-screen, native animated poster/text scrolling, compact two-column Library selection, an up-to-1 GiB persistent image/catalog cache, and native cover fades. Public builds use a configurable Mac Audio Bridge endpoint. See [full release notes / 详细说明](docs/jellyfin-v0.5.101-public1.md) for requirements, limitations, and installation. Older development-phase notes below describe historical milestones, not the current device validation.
+
 ![RetroReel3 original app icon](Jellyfin.frappliance/AppIcon.png)
 
 **An unofficial native Jellyfin client for jailbroken Apple TV 3 (A1469).**
@@ -49,20 +51,20 @@ Native Jellyfin appliance for jailbroken **Apple TV 3 (A1469 / AppleTV3,2)**. No
 ### Compatibility / 兼容性
 
 - Tested hardware and firmware: **AppleTV3,2 / A1469, Apple TV Software 7.9, build 12H1006 (iOS 8.4.4)**.
-- The native playback baseline was tested on physical hardware. The rebranded 0.5.85-brand1 package is independently built and tested offline; **real-device acceptance for this release remains pending**.
+- The native playback baseline was tested on physical hardware. The private 0.5.101 user interface was verified on physical hardware; the privacy-neutral public build has passed offline tests but has not undergone an independent physical-device acceptance test.
 - Other models, firmware builds and jailbreak environments are not validated.
 
 已在上述设备型号和系统版本完成原生播放基础版真机验证。当前品牌版本已完成构建和离线测试；不保证其他型号或固件兼容。
 
 ### Install / 安装
 
-Download the `.deb` file and `SHA256SUMS` from the [RetroReel3 v0.5.85 Release](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.85-brand1). On your Mac/Linux computer, verify the SHA256 listed in `SHA256SUMS`, then run:
+Download the `.deb` file and `SHA256SUMS` from the [RetroReel3 v0.5.101 Release](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1). On your Mac/Linux computer, verify the SHA256 listed in `SHA256SUMS`, then run:
 
-从 RetroReel3 v0.5.85 Release 下载 `.deb` 和 `SHA256SUMS`，先校验哈希，再在 Mac/Linux 终端执行：
+从 RetroReel3 v0.5.101 Release 下载 `.deb` 和 `SHA256SUMS`，先校验哈希，再在 Mac/Linux 终端执行：
 
 ```sh
-scp org.jellyfin.atv3_0.5.85-brand1_iphoneos-arm.deb root@APPLE_TV_IP:/var/root/
-ssh root@APPLE_TV_IP 'dpkg -i /var/root/org.jellyfin.atv3_0.5.85-brand1_iphoneos-arm.deb && launchctl stop com.apple.frontrow && launchctl start com.apple.frontrow'
+scp org.jellyfin.atv3_0.5.101-public1_iphoneos-arm.deb root@APPLE_TV_IP:/var/root/
+ssh root@APPLE_TV_IP 'dpkg -i /var/root/org.jellyfin.atv3_0.5.101-public1_iphoneos-arm.deb && launchctl stop com.apple.frontrow && launchctl start com.apple.frontrow'
 ```
 
 Replace `APPLE_TV_IP` with the target Apple TV's local address. Requires jailbreak, root SSH and `dpkg`. Restart only the FrontRow host, not the entire device.
@@ -73,7 +75,7 @@ Replace `APPLE_TV_IP` with the target Apple TV's local address. Requires jailbre
 >
 > ATV3 内置的旧版 curl/SSL 可能无法连接 GitHub HTTPS，建议电脑下载后通过 SCP 传入。
 
-**Upgrade safety / 升级兼容：** Package ID (org.jellyfin.atv3), internal bundle path, principal class and saved session keys remain unchanged for existing installations. Only the visible app name and artwork change. / 为保留升级兼容性，程序路径、包标识和登录数据保持不变，只改变对外名称与图标。
+**Upgrade safety / 升级兼容：** Package ID (org.jellyfin.atv3), internal bundle path, principal class and saved session keys remain unchanged for existing installations. The current release updates the libraries UI and configurable bridge endpoint. / 本版本升级 Libraries 界面及可配置 Bridge 地址，包标识和路径不变。
 
 ### Features / 功能
 
@@ -93,7 +95,7 @@ Requires macOS, Xcode Command Line Tools, a compatible Theos/iPhoneOS SDK and Py
 ```sh
 make shell
 Scripts/package.sh build/iPhoneOS11.4.sdk-ios8.0/Jellyfin.frappliance build/package-local
-JF_PACKAGE=build/package-local/org.jellyfin.atv3_0.5.85-brand1_iphoneos-arm.deb make test-offline test-asan
+JF_PACKAGE=build/package-local/org.jellyfin.atv3_0.5.101-public1_iphoneos-arm.deb make test-offline test-asan
 ```
 
 Use a fresh output directory for each `Scripts/package.sh` invocation. The project has no dependency on redistributing Apple system binaries or proprietary SDKs.
@@ -102,7 +104,7 @@ Use a fresh output directory for each `Scripts/package.sh` invocation. The proje
 
 ### Optional developer probes / 可选开发诊断
 
-The legacy network/presentation probes are **disabled unless explicitly enabled**. They do not contain a personal LAN address. For those specialized experiments, the developer must provide the origin in the root-owned device file `/var/root/.jellyfin-atv3-probe-origin` (example format: `http://PROBE_SERVER_IP:18780`). The standalone synthetic server accepts `--bind`; it defaults to loopback. Normal Jellyfin playback does not use this setting.
+The legacy network/presentation probes are **disabled unless explicitly enabled**. They do not contain a personal LAN address. The public binary uses a loopback-only URL for diagnostic probes. Developers who need remote probe traffic must modify and rebuild the diagnostic origin. The standalone synthetic probe server is not distributed in this release. Normal Jellyfin playback does not use this setting.
 
 开发诊断探针默认不启动；要运行专门的实验，需自行指定诊断服务器地址。普通播放不需要此配置。
 

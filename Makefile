@@ -5,7 +5,8 @@ BUILD ?= build/$(notdir $(IOS_SDK))-ios$(MIN_IOS)
 SOURCES := $(wildcard Sources/*.m Sources/API/*.m Sources/BackRow/*.m Sources/Input/*.m Sources/Navigation/*.m Sources/Playback/*.m)
 OBJECTS := $(patsubst Sources/%.m,$(BUILD)/armv7/%.o,$(SOURCES))
 COMMON := -fblocks -fno-objc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -ISources
-ARMFLAGS := -target armv7-apple-ios$(MIN_IOS) -isysroot "$(IOS_SDK)" $(COMMON)
+ARM_EXTRA_FLAGS ?=
+ARMFLAGS := -target armv7-apple-ios$(MIN_IOS) -isysroot "$(IOS_SDK)" $(COMMON) $(ARM_EXTRA_FLAGS)
 .PHONY: all shell armv7-objects test test-http clean
 all: shell
 armv7-objects: $(OBJECTS)
@@ -18,10 +19,11 @@ shell: armv7-objects
 	cp Jellyfin.frappliance/AppIcon.png $(BUILD)/Jellyfin.frappliance/
 	cp Jellyfin.frappliance/TopRowIcon.png $(BUILD)/Jellyfin.frappliance/
 	cp -R Jellyfin.frappliance/English.lproj $(BUILD)/Jellyfin.frappliance/
-	$(CLANG) $(ARMFLAGS) -bundle $(OBJECTS) -framework Foundation -framework ImageIO -framework CoreGraphics -lobjc -o $(BUILD)/Jellyfin.frappliance/Jellyfin
+	$(CLANG) $(ARMFLAGS) -bundle $(OBJECTS) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText -lobjc -o $(BUILD)/Jellyfin.frappliance/Jellyfin
+	python3 Scripts/check-v2-audio-build.py $(BUILD)/Jellyfin.frappliance/Jellyfin
 build/tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/main.m Tests/JFFixtureProtocol.m Tests/JFDeviceABIFixture.h
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/main.m Tests/JFFixtureProtocol.m -o $@
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/main.m Tests/JFFixtureProtocol.m -o $@
 test: build/tests
 	./build/tests http://fixture.invalid
 test-http: build/tests
@@ -33,7 +35,7 @@ clean:
 
 build/integration: $(SOURCES) $(wildcard Sources/*/*.h) Tests/integration.m Tests/JFFixtureProtocol.m
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/integration.m Tests/JFFixtureProtocol.m -o $@
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/integration.m Tests/JFFixtureProtocol.m -o $@
 test-integration-fixture: build/integration
 	python3 Tests/integration.py --fixture
 test-integration: build/integration
@@ -47,14 +49,14 @@ test-integration-entry: build/integration
 
 build/session-tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/session.m
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/session.m -o $@
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/session.m -o $@
 .PHONY: test-session
 test-session: build/session-tests
 	./build/session-tests
 
 build/host-tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/host.m Tests/JFFixtureProtocol.m
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/host.m Tests/JFFixtureProtocol.m -o $@
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/host.m Tests/JFFixtureProtocol.m -o $@
 .PHONY: test-host test-phase4c
 test-host: build/host-tests
 	./build/host-tests
@@ -66,7 +68,7 @@ test-integration-http: build/integration
 
 build/ui-tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/ui.m Tests/JFFixtureProtocol.m Tests/JFDeviceABIFixture.h
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/ui.m Tests/JFFixtureProtocol.m -o $@
+	$(CLANG) $(COMMON) -DJF_AUDIO_GATE_HOST_FIXTURE -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/ui.m Tests/JFFixtureProtocol.m -o $@
 .PHONY: test-ui test-phase4d
 test-ui: build/ui-tests
 	./build/ui-tests
@@ -87,14 +89,14 @@ test-phase4d: test-phase4c test-ui
 
 build/playback-tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/playback.m Tests/JFPlaybackFixture.m
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/playback.m Tests/JFPlaybackFixture.m -o $@
+	$(CLANG) $(COMMON) -DJF_AUDIO_GATE_HOST_FIXTURE -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/playback.m Tests/JFPlaybackFixture.m -o $@
 .PHONY: test-playback
 test-playback: build/playback-tests
 	./build/playback-tests
 
 build/playback-http: $(SOURCES) $(wildcard Sources/*/*.h) Tests/playback_http.m
 	@mkdir -p build
-	$(CLANG) $(COMMON) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/playback_http.m -o $@
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/playback_http.m -o $@
 .PHONY: test-playback-http test-tls-contracts test-python
 test-playback-http: build/playback-http
 	python3 Tests/run.py --playback
@@ -110,12 +112,18 @@ test-offline: test-phase4d test-playback test-integration-fixture test-python
 # Separate binaries, no clean/removal of historical artifacts.
 ASAN_FLAGS := -fsanitize=address -fno-omit-frame-pointer -g
 build/playback-asan: $(SOURCES) $(wildcard Sources/*/*.h) Tests/playback.m Tests/JFPlaybackFixture.m
-	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/playback.m Tests/JFPlaybackFixture.m -o $@
+	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/playback.m Tests/JFPlaybackFixture.m -o $@
 build/ui-asan: $(SOURCES) $(wildcard Sources/*/*.h) Tests/ui.m Tests/JFFixtureProtocol.m Tests/JFDeviceABIFixture.h
-	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/ui.m Tests/JFFixtureProtocol.m -o $@
+	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/ui.m Tests/JFFixtureProtocol.m -o $@
 build/session-asan: $(SOURCES) $(wildcard Sources/*/*.h) Tests/session.m
-	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework ImageIO -framework CoreGraphics $(SOURCES) Tests/session.m -o $@
+	$(CLANG) $(COMMON) $(ASAN_FLAGS) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/session.m -o $@
 test-asan: build/playback-asan build/ui-asan build/session-asan
 	ASAN_OPTIONS=detect_leaks=0 ./build/playback-asan
 	ASAN_OPTIONS=detect_leaks=0 ./build/ui-asan
 	ASAN_OPTIONS=detect_leaks=0 ./build/session-asan
+
+.PHONY: test-local-srt
+build/local-srt-tests: $(SOURCES) $(wildcard Sources/*/*.h) Tests/local_subtitle.m
+	$(CLANG) $(COMMON) -framework Foundation -framework Security -framework ImageIO -framework CoreGraphics -framework QuartzCore -framework CoreText $(SOURCES) Tests/local_subtitle.m -o $@
+test-local-srt: build/local-srt-tests
+	./build/local-srt-tests

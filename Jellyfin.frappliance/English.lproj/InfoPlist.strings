@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>RetroReel3</string>
+	<string>Jellyfin</string>
 	<key>FRApplianceName</key>
-	<string>RetroReel3</string>
+	<string>Jellyfin</string>
 </dict>
 </plist>

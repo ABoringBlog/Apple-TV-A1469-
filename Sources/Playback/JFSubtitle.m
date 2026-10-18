@@ -17,7 +17,8 @@ NSArray *JFSubtitleTracks(NSArray *streams, NSError **error) {
         [indices addObject:index];
         [tracks addObject:@{@"index":index,@"codec":[codec lowercaseString],@"external":@([stream[@"IsExternal"] boolValue]),
             @"forced":@([stream[@"IsForced"] boolValue]),@"default":@([stream[@"IsDefault"] boolValue]),
-            @"language":stream[@"Language"] ?: @"und",@"title":stream[@"Title"] ?: @""}];
+            @"language":stream[@"Language"] ?: @"und",@"title":stream[@"Title"] ?: @"",
+            @"path":[stream[@"Path"] isKindOfClass:[NSString class]] ? stream[@"Path"] : @""}];
     }
     return tracks;
 }
@@ -64,16 +65,18 @@ NSString *JFSubtitleTrackLabel(NSDictionary *track) {
 NSDictionary *JFSubtitleSelection(NSArray *tracks, NSInteger index, BOOL preserve, NSError **error) {
     if (error) *error=nil;
     if (![tracks isKindOfClass:[NSArray class]]) return Bad(error);
-    if (index==-1) return @{@"index":@(-1),@"strategy":@"off",@"provisional":@YES};
+    if (index==-1) return @{@"index":@(-1),@"strategy":@"off",@"provisional":@NO};
     for (NSDictionary *track in tracks) {
         if (![track isKindOfClass:[NSDictionary class]] || !JFTicks(track[@"index"]) || ![track[@"codec"] isKindOfClass:[NSString class]]) return Bad(error);
         if ([track[@"index"] integerValue]!=index) continue;
-        NSString *codec=track[@"codec"], *strategy=nil;
-        if ([@[@"srt",@"subrip"] containsObject:codec]) strategy=[track[@"external"] boolValue] ? @"direct subtitle" : @"server-side conversion";
-        else if ([@[@"ass",@"ssa"] containsObject:codec]) strategy=preserve ? @"burn-in required" : @"server-side conversion";
-        else if ([@[@"pgs",@"pgssub",@"hdmv_pgs_subtitle",@"dvdsub"] containsObject:codec]) strategy=@"burn-in required";
-        else return Bad(error);
-        return @{@"index":@(index),@"strategy":strategy,@"format":@"srt",@"provisional":@YES,@"losesStyling":@([@[@"ass",@"ssa"] containsObject:codec] && !preserve)};
+        NSString *codec=track[@"codec"];
+        if (![@[@"srt",@"subrip",@"ass",@"ssa",@"pgs",@"pgssub",@"hdmv_pgs_subtitle",@"dvdsub"] containsObject:codec]) return Bad(error);
+        // SRT is composed over the original video locally; complex formats
+        // must be preprocessed to SRT, not silently trigger video burn-in.
+        BOOL local=[@[@"srt",@"subrip"] containsObject:codec];
+        return @{@"index":@(index),
+                 @"strategy":local ? @"local-srt" : @"preprocess-required",
+                 @"provisional":@NO,@"losesStyling":@( !local )};
     }
     return Bad(error);
 }

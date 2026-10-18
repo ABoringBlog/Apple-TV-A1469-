@@ -14,24 +14,6 @@ static void JFATV3ScheduleRealPlaybackProbeIfEnabled(void);
 #include <string.h>
 static NSString * const JFProbeEnable=@"/tmp/Jellyfin-ATV3.playbackprobe-enable";
 static NSString * const JFProbeLog=@"/tmp/Jellyfin-ATV3.playbackprobe";
-static NSString * const JFProbeOriginConfig=@"/var/root/.jellyfin-atv3-probe-origin";
-// Optional diagnostics only: a root-owned configuration file must explicitly
-// provide an HTTP origin (scheme, host, and port). Normal playback never uses it.
-static NSURL *JFDiagnosticProbeURL(NSString *path) {
-    if (![path hasPrefix:@"/"] || [path hasPrefix:@"//"]) return nil;
-    NSString *raw=[NSString stringWithContentsOfFile:JFProbeOriginConfig
-                                              encoding:NSUTF8StringEncoding error:NULL];
-    if (!raw.length) return nil;
-    NSString *origin=[raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSURLComponents *parts=[NSURLComponents componentsWithString:origin];
-    if (![parts.scheme.lowercaseString isEqualToString:@"http"] ||
-        !parts.host.length || !parts.port || [parts.port integerValue]<1 ||
-        [parts.port integerValue]>65535 || parts.path.length ||
-        parts.query.length || parts.fragment.length || parts.user.length || parts.password.length)
-        return nil;
-    return [NSURL URLWithString:[origin stringByAppendingString:path]];
-}
-
 static void JFProbeWrite(NSString *line) {
     NSData *data=[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
     int fd=open([JFProbeLog fileSystemRepresentation],O_WRONLY|O_CREAT|O_APPEND,0600);
@@ -115,9 +97,7 @@ static void JFPresentationWrite(NSString *line) {
 }
 - (void)begin {
     @try {
-        NSURL *probeURL=JFDiagnosticProbeURL(@"/plain/master.m3u8");
-        if (!probeURL) { JFPresentationWrite(@"PRESENT_ABORT reason=probe-origin-unconfigured"); [self finish]; return; }
-        NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:probeURL];
+        NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:18780/plain/master.m3u8"]];
         [request setValue:@"Bearer JF-PROBE-ONLY-12H1006" forHTTPHeaderField:@"Authorization"];
         _gateway=[[JFMediaGateway alloc] initWithRequest:request];
         _backend=[[JFATV3PlaybackBackend alloc] initWithHostController:nil];
@@ -183,9 +163,7 @@ static void JFNetworkWrite(NSString *line) {
     NSArray *paths=@[@"/plain/clip.mp4",@"/plain/master.m3u8",@"/encrypted/master.m3u8",@"/same/master.m3u8",@"/cross/master.m3u8",@"/child/master.m3u8",@"/segment-redirect/master.m3u8"];
     if (_caseIndex>=paths.count) { JFNetworkWrite(@"NETWORK_END"); [self release]; return; }
     NSString *path=paths[_caseIndex];
-    NSURL *probeURL=JFDiagnosticProbeURL(path);
-    if (!probeURL) { JFNetworkWrite(@"NETWORK_ABORT reason=probe-origin-unconfigured"); [self release]; return; }
-    NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:probeURL];
+    NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[@"http://127.0.0.1:18780" stringByAppendingString:path]]];
     [request setValue:@"Bearer JF-PROBE-ONLY-12H1006" forHTTPHeaderField:@"Authorization"];
     _backend=[[JFATV3PlaybackBackend alloc] initWithHostController:nil];
     @try {

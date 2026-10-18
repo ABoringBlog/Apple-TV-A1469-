@@ -50,16 +50,31 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
     NSString *path=[reference substringToIndex:end];
     return [path.lowercaseString hasSuffix:@".m3u8"];
 }
+static NSUInteger JFRouteIndex(NSString *path) {
+    NSString *prefix=@"/jf/resource";
+    if (![path isKindOfClass:[NSString class]] || ![path hasPrefix:prefix] || path.length<=prefix.length+4) return NSNotFound;
+    NSRange dot=[path rangeOfString:@"." options:0 range:NSMakeRange(prefix.length,path.length-prefix.length)];
+    if (dot.location==NSNotFound || dot.location==prefix.length) return NSNotFound;
+    NSString *digits=[path substringWithRange:NSMakeRange(prefix.length,dot.location-prefix.length)];
+    if (digits.length>5 || [digits rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location!=NSNotFound) return NSNotFound;
+    NSString *suffix=[[path substringFromIndex:dot.location+1] lowercaseString];
+    if (![@[@"bin",@"m3u8"] containsObject:suffix]) return NSNotFound;
+    unsigned long long value=strtoull(digits.UTF8String,NULL,10);
+    return value>0 && value<=8192 ? (NSUInteger)value : NSNotFound;
+}
 @interface JFMediaGateway ()
 - (BOOL)stopped;
 - (NSString *)routeForReference:(NSString *)reference relativeTo:(NSURL *)base;
+- (NSString *)routeForReferenceLocked:(NSString *)reference relativeTo:(NSURL *)base;
+- (NSString *)registeredRouteForReference:(NSString *)storedReference base:(NSURL *)storedBase;
 - (NSURL *)resolvedURLForRoute:(id)entry;
 - (void)listen;
 - (void)serve:(NSNumber *)descriptor;
 @end
 
 @interface JFMediaTransfer : NSObject <NSURLConnectionDataDelegate> {
-@public JFMediaGateway *gateway; int fd; BOOL done, failed, headersSent, playlist, head;
+@public JFMediaGateway *gateway; int fd; BOOL done, failed, headersSent, playlist, head, firstDataLogged;
+    NSTimeInterval requestStarted;
     NSMutableData *body; NSURL *url; NSHTTPURLResponse *response;
 }
 @end
@@ -79,7 +94,12 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
     }
     response=[(NSHTTPURLResponse *)r retain];
     NSInteger status=response.statusCode;
-    JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM status=%ld kind=%@",(long)status,JFGatewayKind(url)]);
+    NSUInteger headerMillis=(NSUInteger)MAX(0,([NSProcessInfo processInfo].systemUptime-requestStarted)*1000.0);
+    NSString *kind=JFGatewayKind(url);
+    if ([kind isEqual:@"m3u8"])
+        JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_TTFB phase=headers kind=%@ ms=%lu status=%ld",kind,(unsigned long)headerMillis,(long)status]);
+    if ([kind isEqual:@"m3u8"] || (status!=200 && status!=206))
+        JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM status=%ld kind=%@",(long)status,kind]);
     if (status!=200 && status!=206) {
         // Return only status, never upstream headers, body, URL or error descriptions.
         NSInteger safeStatus=[@[@401,@403,@404,@416] containsObject:@(status)] ? status : 502;
@@ -92,7 +112,8 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
         JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM encoding=other kind=%@",JFGatewayKind(url)]);
         failed=done=YES; [c cancel]; return;
     }
-    JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM encoding=%@ kind=%@",encoding.length ? @"identity" : @"none",JFGatewayKind(url)]);
+    if (playlist)
+        JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM encoding=%@ kind=%@",encoding.length ? @"identity" : @"none",JFGatewayKind(url)]);
     playlist=[url.pathExtension.lowercaseString isEqual:@"m3u8"] || [type.lowercaseString containsString:@"mpegurl"];
     if (playlist) {
         if (status!=200) {
@@ -114,6 +135,13 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
 }
 - (void)connection:(NSURLConnection *)c didReceiveData:(NSData *)data {
     if ([gateway stopped]) { failed=done=YES; [c cancel]; return; }
+    if (!firstDataLogged && data.length) {
+        firstDataLogged=YES;
+        NSUInteger firstDataMillis=(NSUInteger)MAX(0,([NSProcessInfo processInfo].systemUptime-requestStarted)*1000.0);
+        NSString *kind=JFGatewayKind(url);
+        if ([kind isEqual:@"m3u8"] || firstDataMillis>=200)
+            JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_TTFB phase=data kind=%@ ms=%lu",kind,(unsigned long)firstDataMillis]);
+    }
     if (playlist) {
         if (body.length+data.length>JFMaxPlaylistBytes) {
             JFPlaybackTrace(@"GATEWAY_PLAYLIST body-limit=1");
@@ -166,80 +194,111 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
         _listener=-1;
         if (![request isKindOfClass:[NSURLRequest class]] || ![request valueForHTTPHeaderField:@"Authorization"].length ||
             ![[self class] allowedURL:request.URL.absoluteString relativeTo:request.URL origin:request.URL]) { [self release]; return nil; }
-        _source=[request copy]; _lock=[NSLock new]; _routes=[NSMutableDictionary new]; _routesByParent=[NSMutableDictionary new]; _clients=[NSMutableSet new];
+        _source=[request copy]; _lock=[NSLock new]; _routes=[NSMutableArray new]; [_routes addObject:[NSNull null]]; _playlistCache=[NSMutableDictionary new]; _clients=[NSMutableSet new];
     }
     return self;
 }
 - (BOOL)stopped { [_lock lock]; BOOL value=_stopped; [_lock unlock]; return value; }
-- (NSString *)routeForReference:(NSString *)reference relativeTo:(NSURL *)base {
+- (NSString *)registeredRouteForReference:(NSString *)storedReference base:(NSURL *)storedBase {
+    if (!storedReference.length || !storedBase || _routes.count>8192) return nil;
+    NSUInteger index=_routes.count;
+    [_routes addObject:@[storedReference,storedBase]];
+    NSString *ext=JFReferenceIsPlaylist(storedReference) ? @"m3u8" : @"bin";
+    return [NSString stringWithFormat:@"http://127.0.0.1:%u/jf/resource%lu.%@",_port,(unsigned long)index,ext];
+}
+- (NSString *)routeForReferenceLocked:(NSString *)reference relativeTo:(NSURL *)base {
     if (!JFReferenceBasicSafe(reference) || !base) return nil;
     NSString *storedReference=reference;
     NSURL *storedBase=base;
-    // Absolute/scheme-relative references are uncommon and security-sensitive: validate now.
-    // Ordinary relative HLS segments stay opaque until requested, avoiding thousands of NSURL parses at startup.
     if (JFReferenceNeedsImmediateValidation(reference)) {
         NSURL *resolved=[[self class] allowedURL:reference relativeTo:base origin:_source.URL];
         if (!resolved) return nil;
         storedReference=resolved.absoluteString;
         storedBase=_source.URL;
     }
-    NSString *parentKey=storedBase.absoluteString;
-    if (!parentKey.length) return nil;
+    return [self registeredRouteForReference:storedReference base:storedBase];
+}
+- (NSString *)routeForReference:(NSString *)reference relativeTo:(NSURL *)base {
     [_lock lock];
-    NSMutableDictionary *parent=[_routesByParent objectForKey:parentKey];
-    if (!parent) {
-        parent=[NSMutableDictionary dictionary];
-        [_routesByParent setObject:parent forKey:parentKey];
-    }
-    NSString *route=[parent objectForKey:storedReference];
-    if (!route && _routes.count<8192) {
-        NSString *ext=JFReferenceIsPlaylist(storedReference) ? @"m3u8" : @"bin";
-        route=[NSString stringWithFormat:@"/jf/resource%lu.%@",(unsigned long)++_nextRoute,ext];
-        [_routes setObject:@{@"reference":storedReference,@"base":storedBase} forKey:route];
-        [parent setObject:route forKey:storedReference];
-    }
-    NSString *result=route ? [[NSString alloc] initWithFormat:@"http://127.0.0.1:%u%@",_port,route] : nil;
+    NSString *result=[[self routeForReferenceLocked:reference relativeTo:base] retain];
     [_lock unlock];
     return [result autorelease];
 }
 - (NSURL *)resolvedURLForRoute:(id)entry {
-    if (![entry isKindOfClass:[NSDictionary class]]) return nil;
-    NSString *reference=[entry objectForKey:@"reference"];
-    NSURL *base=[entry objectForKey:@"base"];
+    if (![entry isKindOfClass:[NSArray class]] || [entry count]!=2) return nil;
+    NSString *reference=[entry objectAtIndex:0];
+    NSURL *base=[entry objectAtIndex:1];
     return [[self class] allowedURL:reference relativeTo:base origin:_source.URL];
 }
 - (NSData *)rewritePlaylist:(NSData *)data URL:(NSURL *)url {
     NSTimeInterval started=[NSProcessInfo processInfo].systemUptime;
     if (data.length>JFMaxPlaylistBytes) { JFPlaybackTrace(@"GATEWAY_REWRITE ok=0 reason=size"); return nil; }
+    NSString *cacheKey=url.absoluteString;
+    if (cacheKey.length) {
+        [_lock lock];
+        NSDictionary *cached=[[_playlistCache objectForKey:cacheKey] retain];
+        [_lock unlock];
+        NSData *cachedInput=[cached objectForKey:@"input"];
+        NSData *cachedOutput=[cached objectForKey:@"output"];
+        if ([cachedInput isEqualToData:data] && cachedOutput.length) {
+            NSData *result=[[cachedOutput retain] autorelease];
+            [cached release];
+            NSUInteger millis=(NSUInteger)MAX(0,([NSProcessInfo processInfo].systemUptime-started)*1000.0);
+            JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_REWRITE cache=1 ms=%lu",(unsigned long)millis]);
+            return result;
+        }
+        [cached release];
+    }
+
     NSString *text=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
     if (![text hasPrefix:@"#EXTM3U"] || [text containsString:@"#EXT-X-DEFINE"] || [text containsString:@"{$"]) {
         JFPlaybackTrace(@"GATEWAY_REWRITE ok=0 reason=format"); return nil;
     }
+
     NSMutableArray *lines=[NSMutableArray array];
     NSRegularExpression *attributes=[NSRegularExpression regularExpressionWithPattern:@"URI=\"([^\"]*)\"" options:0 error:NULL];
+    NSString *failure=nil;
+    [_lock lock];
     for (NSString *raw in [text componentsSeparatedByString:@"\n"]) {
         NSString *line=[raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (line.length && ![line hasPrefix:@"#"]) {
-            NSString *route=[self routeForReference:line relativeTo:url];
-            if (!route) { JFPlaybackTrace(@"GATEWAY_REWRITE ok=0 reason=child"); return nil; }
+            NSString *route=[self routeForReferenceLocked:line relativeTo:url];
+            if (!route) { failure=@"child"; break; }
             [lines addObject:route];
         } else if ([line containsString:@"URI="]) {
             NSArray *matches=[attributes matchesInString:line options:0 range:NSMakeRange(0,line.length)];
-            if (!matches.count) { JFPlaybackTrace(@"GATEWAY_REWRITE ok=0 reason=attribute"); return nil; }
+            if (!matches.count) { failure=@"attribute"; break; }
             NSMutableString *replacement=[[line mutableCopy] autorelease];
             for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
                 NSRange range=[match rangeAtIndex:1];
-                NSString *route=[self routeForReference:[line substringWithRange:range] relativeTo:url];
-                if (!route) { JFPlaybackTrace(@"GATEWAY_REWRITE ok=0 reason=attribute-child"); return nil; }
+                NSString *route=[self routeForReferenceLocked:[line substringWithRange:range] relativeTo:url];
+                if (!route) { failure=@"attribute-child"; break; }
                 [replacement replaceCharactersInRange:range withString:route];
             }
+            if (failure) break;
             [lines addObject:replacement];
         } else [lines addObject:line];
     }
-    NSUInteger routes=0; [_lock lock]; routes=_routes.count; [_lock unlock];
+    NSUInteger routes=_routes.count>0 ? _routes.count-1 : 0;
+    [_lock unlock];
+    if (failure) {
+        JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_REWRITE ok=0 reason=%@",failure]);
+        return nil;
+    }
+
+    NSData *rewritten=[[lines componentsJoinedByString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (rewritten.length && cacheKey.length) {
+        [_lock lock];
+        if (_playlistCache.count>=4 && ![_playlistCache objectForKey:cacheKey]) {
+            NSString *oldest=[[_playlistCache allKeys] firstObject];
+            if (oldest) [_playlistCache removeObjectForKey:oldest];
+        }
+        [_playlistCache setObject:@{@"input":data,@"output":rewritten} forKey:cacheKey];
+        [_lock unlock];
+    }
     NSUInteger millis=(NSUInteger)MAX(0,([NSProcessInfo processInfo].systemUptime-started)*1000.0);
     JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_REWRITE ok=1 routes=%lu ms=%lu",(unsigned long)routes,(unsigned long)millis]);
-    return [[lines componentsJoinedByString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    return rewritten;
 }
 - (BOOL)start:(NSError **)error {
     if (error) *error=nil;
@@ -295,7 +354,10 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
             BOOL valid=first.count==3 && (head || [first.firstObject isEqual:@"GET"]);
             NSURL *url=nil; id routeEntry=nil; NSString *range=nil,*host=nil;
             if (valid) {
-                [_lock lock]; routeEntry=[[_routes objectForKey:first[1]] retain]; [_lock unlock];
+                NSUInteger routeIndex=JFRouteIndex(first[1]);
+                [_lock lock];
+                if (routeIndex!=NSNotFound && routeIndex<_routes.count) routeEntry=[[_routes objectAtIndex:routeIndex] retain];
+                [_lock unlock];
                 url=[[self resolvedURLForRoute:routeEntry] retain];
                 [routeEntry release];
                 if (!url) valid=NO;
@@ -314,7 +376,9 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
                 JFPlaybackTrace(@"GATEWAY_CLIENT valid=0");
                 JFSendText(fd,@"HTTP/1.1 400 Bad request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             } else {
-                JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_CLIENT valid=1 kind=%@ head=%d range=%d",JFGatewayKind(url),head,range!=nil]);
+                NSString *clientKind=JFGatewayKind(url);
+                if ([clientKind isEqual:@"m3u8"] || head || range)
+                    JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_CLIENT valid=1 kind=%@ head=%d range=%d",clientKind,head,range!=nil]);
                 NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:30];
                 [request setHTTPShouldHandleCookies:NO];
                 [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
@@ -324,6 +388,7 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
                 }
                 if (range && ![url.pathExtension.lowercaseString isEqual:@"m3u8"]) [request setValue:range forHTTPHeaderField:@"Range"];
                 JFMediaTransfer *transfer=[JFMediaTransfer new]; transfer->gateway=self; transfer->fd=fd; transfer->head=head; transfer->url=[url retain];
+                transfer->requestStarted=[NSProcessInfo processInfo].systemUptime;
                 NSURLConnection *connection=[[NSURLConnection alloc] initWithRequest:request delegate:transfer startImmediately:YES];
                 if (!connection) {
                     JFPlaybackTrace([NSString stringWithFormat:@"GATEWAY_UPSTREAM connection=0 kind=%@",JFGatewayKind(url)]);
@@ -345,5 +410,5 @@ static BOOL JFReferenceIsPlaylist(NSString *reference) {
     for (NSNumber *fd in _clients) shutdown(fd.intValue,SHUT_RDWR);
     [_lock unlock];
 }
-- (void)dealloc { [self stop]; [_source release]; [_lock release]; [_routes release]; [_routesByParent release]; [_clients release]; [_localRequest release]; [super dealloc]; }
+- (void)dealloc { [self stop]; [_source release]; [_lock release]; [_routes release]; [_playlistCache release]; [_clients release]; [_localRequest release]; [super dealloc]; }
 @end

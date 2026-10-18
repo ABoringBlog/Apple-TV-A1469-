@@ -4,6 +4,7 @@
 #import "BackRow/JFBackRow.h"
 #import "BackRow/JFBRMenu.h"
 #import "BackRow/JFUIController.h"
+#import "Input/JFRemote.h"
 #import "JFDeviceABIFixture.h"
 #import "Navigation/JFSession.h"
 static NSUserDefaults *configurationDefaults;
@@ -15,7 +16,7 @@ static void CleanConfiguration(void) {
     [configurationDefaults synchronize];
 }
 static void ResetConfiguration(void) { [configurationDefaults removeObjectForKey:@"ServerConfiguration"]; [configurationDefaults removeObjectForKey:@"SessionCredential"]; }
-static BOOL multiLibraries, unsupportedLibrary, badList, emptySeasons, emptyEpisodes;
+static BOOL multiLibraries, unsupportedLibrary, badList, emptySeasons, emptyEpisodes, pagedMovies;
 
 static CGSize TestImagePixelSize(NSData *data) {
     if (![data isKindOfClass:[NSData class]] || !data.length) return CGSizeZero;
@@ -33,7 +34,37 @@ static NSUInteger configurationRequests;
 @implementation UIFixtureProtocol
 - (void)startLoading {
     @synchronized([UIFixtureProtocol class]) { configurationRequests++; }
-    if ((emptySeasons && [self.request.URL.path hasSuffix:@"/Shows/series1/Seasons"]) ||
+    // Simulate a 150-movie library served over two API pages.
+    if (pagedMovies && [self.request.URL.path isEqual:@"/jellyfin/Items"] &&
+        [[self.request.URL query] containsString:@"IncludeItemTypes=Movie"] &&
+        [[self.request.URL query] containsString:@"ParentId=lib1"]) {
+        NSURLComponents *components=[NSURLComponents componentsWithURL:self.request.URL
+                                              resolvingAgainstBaseURL:NO];
+        NSUInteger start=0,limit=101;
+        for(NSURLQueryItem *q in components.queryItems) {
+            if([q.name isEqual:@"StartIndex"])start=[q.value integerValue];
+            if([q.name isEqual:@"Limit"])limit=[q.value integerValue];
+        }
+        NSUInteger count=start>=150?0:MIN(limit,150-start);
+        NSMutableArray *items=[NSMutableArray array];
+        for (NSUInteger i=start;i<start+count;i++)
+            [items addObject:@{@"Id":[NSString stringWithFormat:@"movie%lu",(unsigned long)i],
+                               @"Name":[NSString stringWithFormat:@"Film %lu",(unsigned long)i],
+                               @"Type":@"Movie",@"ProductionYear":@2020}];
+        NSData *payload=[NSJSONSerialization dataWithJSONObject:@{@"Items":items} options:0 error:NULL];
+        NSHTTPURLResponse *reply=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
+        [self.client URLProtocol:self didReceiveResponse:reply cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:payload]; [self.client URLProtocolDidFinishLoading:self];
+    } else if (multiLibraries && [self.request.URL.path isEqual:@"/jellyfin/Items"] &&
+               [[self.request.URL query] containsString:@"ParentId=lib2"] &&
+               [[self.request.URL query] containsString:@"IncludeItemTypes=Movie"]) {
+        NSDictionary *replyObj=@{@"Items":@[@{@"Id":@"movie1",@"Name":@"Movie",@"Type":@"Movie"}]};
+        NSData *data=[NSJSONSerialization dataWithJSONObject:replyObj options:0 error:NULL];
+        NSHTTPURLResponse *reply=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+            statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
+        [self.client URLProtocol:self didReceiveResponse:reply cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:data];[self.client URLProtocolDidFinishLoading:self];
+    } else if ((emptySeasons && [self.request.URL.path hasSuffix:@"/Shows/series1/Seasons"]) ||
         (emptyEpisodes && [self.request.URL.path hasSuffix:@"/Shows/series1/Episodes"])) {
         NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"Items":@[]} options:0 error:NULL];
         NSHTTPURLResponse *response=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
@@ -247,6 +278,8 @@ static void WaitTitle(UIMedia *controller, NSString *fragment) {
     NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:5];
     while ((![controller.listTitle containsString:fragment] || [controller.listTitle containsString:@"Loading"]) && deadline.timeIntervalSinceNow>0)
         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    if(![controller.listTitle containsString:fragment] || [controller.listTitle containsString:@"Loading"])
+        NSLog(@"WAIT_TITLE_FAILED wanted=%@ saw=%@",fragment,controller.listTitle);
     CHECK([controller.listTitle containsString:fragment] && ![controller.listTitle containsString:@"Loading"]);
 }
 static void Choose(UIMedia *controller, long row) {
@@ -407,7 +440,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     CHECK(appliance!=nil);
     NSArray *categories=[appliance applianceCategories];
     CHECK(categories.count==1 && categoryCalls==1 && categoryOrder==0.0f);
-    CHECK([categories[0][@"identifier"] isEqual:@"jellyfin"] && [categories[0][@"name"] isEqual:@"RetroReel3"]);
+    CHECK([categories[0][@"identifier"] isEqual:@"jellyfin"] && [categories[0][@"name"] isEqual:@"Jellyfin"]);
     if ([mode isEqual:@"normal"]) {
         UIMedia *direct=[[appliance applianceController] retain];
         CHECK(direct!=nil && [direct isKindOfClass:objc_getClass("JellyfinController")]);
@@ -427,7 +460,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         printf("PASS: wrong event encoding rejected (%d assertions)\n",checks); return 0;
     }
     [controller controlWasActivated];
-    CHECK(activations==1 && [controller.listTitle isEqual:@"RetroReel3"]);
+    CHECK(activations==1 && [controller.listTitle isEqual:@"Jellyfin"]);
     CHECK(controller.list.datasource && controller.list.reloads==1);
     JFBRMenu *menu=[controller.list.datasource retain];
     [menu displayTitle:@"Libraries" rows:@[@{@"title":@"Movies",@"enabled":@YES},@{@"title":@"Empty",@"enabled":@NO}] selection:1];
@@ -440,7 +473,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     [controller controlWasDeactivated]; CHECK(deactivations==1 && !controller.list.datasource);
     NSUInteger reloads=controller.list.reloads;
     [menu displayTitle:@"Paused" rows:@[] selection:0]; CHECK(controller.list.reloads==reloads);
-    [controller controlWasActivated]; CHECK(activations==2 && [controller.listTitle isEqual:@"RetroReel3"]);
+    [controller controlWasActivated]; CHECK(activations==2 && [controller.listTitle isEqual:@"Jellyfin"]);
     [controller wasPopped]; CHECK(!controller.list.datasource && pops==1 && [menu itemCount]==0);
     [controller controlWasActivated]; CHECK(!controller.list.datasource);
     [menu release]; [controller release]; [appliance release];
@@ -501,15 +534,17 @@ int main(int argc, char **argv) { @autoreleasepool {
     CHECK(![(UIPreview *)posterPreview cropAndFill]);
     CHECK([controller previewControlForItem:1]==nil);
     Choose(controller,0); WaitTitle(controller,@"Movie  1999");
-    CHECK([[menu titleForRow:0] isEqual:@"1999  •  1h 42m  •  8.2/10  •  R"] && ![menu rowSelectable:0]);
-    CHECK([[menu titleForRow:1] isEqual:@"Drama, Crime"] && ![menu rowSelectable:1]);
-    CHECK([[menu titleForRow:2] isEqual:@"Detail"] && ![menu rowSelectable:2]);
+    // Redesign: facts/genres/overview are rendered in a single non-action information pane.
+    CHECK([[menu titleForRow:0] isEqual:@"Play"] && [menu rowSelectable:0]);
+    CHECK([[[menu titleForRow:1] lowercaseString] containsString:@"watched"] && [menu rowSelectable:1]);
+    CHECK([[menu titleForRow:2] containsString:@"Favorite"] && [menu rowSelectable:2]);
+    CHECK([[menu titleForRow:[menu itemCount]-1] isEqual:@"Information"]);
     id movieDetailPreview=[controller previewControlForItem:0];
     CHECK([movieDetailPreview isKindOfClass:objc_getClass("BRAsyncImageControl")]);
     CHECK([[(UIPreview *)movieDetailPreview image] isKindOfClass:objc_getClass("ATVImage")]);
-    Choose(controller,3); WaitTitle(controller,@"Media");
+    Press(controller,1); WaitTitle(controller,@"Media");
     Choose(controller,1); WaitTitle(controller,@"Libraries");
-    Choose(controller,2); WaitTitle(controller,@"RetroReel3");
+    Choose(controller,2); WaitTitle(controller,@"Jellyfin");
     CHECK([configurationDefaults objectForKey:@"SessionCredential"]==nil);
     CHECK([menu itemCount]==5 && [[menu titleForRow:3] isEqual:@"Sign in"]);
 
@@ -518,7 +553,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     [configurationDefaults setObject:baseConfig forKey:@"ServerConfiguration"];
     [configurationDefaults setObject:@{@"version":@1,@"server":@"http://fixture.invalid/jellyfin",@"deviceID":@"test-device",@"token":@"expired"} forKey:@"SessionCredential"];
     UIMedia *expired=[[objc_getClass("JellyfinController") alloc] init]; [expired controlWasActivated];
-    JFBRMenu *expiredMenu=[expired.list.datasource retain]; WaitTitle(expired,@"RetroReel3");
+    JFBRMenu *expiredMenu=[expired.list.datasource retain]; WaitTitle(expired,@"Jellyfin");
     CHECK([configurationDefaults objectForKey:@"SessionCredential"]==nil);
     CHECK([[expiredMenu titleForRow:5] containsString:@"authentication failed (401)"]);
     [expired wasPopped]; [expiredMenu release]; [expired release];
@@ -528,16 +563,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     [configurationDefaults setObject:offlineConfig forKey:@"ServerConfiguration"];
     [configurationDefaults setObject:@{@"version":@1,@"server":@"https://fixture.invalid/disconnect",@"deviceID":@"test-device",@"token":@"fixture-token"} forKey:@"SessionCredential"];
     UIMedia *offline=[[objc_getClass("JellyfinController") alloc] init]; [offline controlWasActivated];
-    JFBRMenu *offlineMenu=[offline.list.datasource retain]; WaitTitle(offline,@"RetroReel3");
+    JFBRMenu *offlineMenu=[offline.list.datasource retain]; WaitTitle(offline,@"Jellyfin");
     CHECK([[[configurationDefaults objectForKey:@"SessionCredential"] objectForKey:@"token"] isEqual:@"fixture-token"]);
     CHECK([[offlineMenu titleForRow:5] containsString:@"network"]);
     [offline wasPopped]; [offlineMenu release]; [offline release];
-    Enter(controller,1,@"bad"); Enter(controller,2,@"wrong"); WaitTitle(controller,@"RetroReel3");
+    Enter(controller,1,@"bad"); Enter(controller,2,@"wrong"); WaitTitle(controller,@"Jellyfin");
     CHECK([[menu titleForRow:5] containsString:@"authentication failed (401)"]);
     Enter(controller,1,@"empty"); Enter(controller,2,@"x"); WaitTitle(controller,@"Libraries");
     CHECK([[menu titleForRow:0] isEqual:@"No libraries available"] && ![menu rowSelectable:0]);
     Choose(controller,1); WaitTitle(controller,@"Libraries");
-    Choose(controller,2); WaitTitle(controller,@"RetroReel3");
+    Choose(controller,2); WaitTitle(controller,@"Jellyfin");
     // Input cancellation resumes presentation without submitting credentials.
     Choose(controller,2); UIEditor *cancelled=[controller.testStack.pushed retain];
     CHECK(cancelled!=nil); [controller.testStack popController];
@@ -563,32 +598,37 @@ int main(int argc, char **argv) { @autoreleasepool {
     Enter(controller,0,@"http://fixture.invalid/jellyfin"); Enter(controller,1,@"测试用户");
     Choose(controller,4); Enter(controller,2,@"p\"ass"); WaitTitle(controller,@"Libraries");
     Choose(controller,0); WaitTitle(controller,@"Media"); Choose(controller,0); WaitTitle(controller,@"Movie  1999");
-    CHECK([[menu titleForRow:4] isEqual:@"Play"]); Choose(controller,4); WaitTitle(controller,@"setup");
+    // Playback regression preserved with redesigned action positions.
+    CHECK([[menu titleForRow:0] isEqual:@"Play"]); Choose(controller,0); WaitTitle(controller,@"setup");
+    CHECK(controller.list.selection==0); // Async Play must not jump to Watched.
+    CHECK([menu rowSelectable:0]);
     NSDate *ready=[NSDate dateWithTimeIntervalSinceNow:3];
     while (!mock.starts && ready.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     CHECK(mock.starts==1); [mock emit:@"started" ticks:0]; WaitTitle(controller,@"playing");
-    Choose(controller,3); WaitTitle(controller,@"paused"); Choose(controller,3); WaitTitle(controller,@"setup");
-    ready=[NSDate dateWithTimeIntervalSinceNow:3];
-    while (mock.starts<2 && ready.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-    CHECK(mock.starts==2); [mock emit:@"started" ticks:0]; WaitTitle(controller,@"playing");
-    Choose(controller,4); CHECK([(JFUIController *)menu playback].positionTicks==300000000);
-    [mock emit:@"paused" ticks:300000000]; WaitTitle(controller,@"paused");
-    CHECK([[menu titleForRow:3] isEqual:@"Resume"]);
+    CHECK([[menu titleForRow:0] isEqual:@"Pause"]);
+    Choose(controller,0); WaitTitle(controller,@"paused");
+    NSUInteger resumeStarts=mock.starts, resumeStops=mock.stops;
+    Choose(controller,0); WaitTitle(controller,@"playing");
+    CHECK(mock.starts==resumeStarts && mock.stops==resumeStops);
+    Press(controller,7); CHECK([(JFUIController *)menu playback].positionTicks==3000000000LL);
+    Press(controller,6); CHECK([(JFUIController *)menu playback].positionTicks==0);
+    Press(controller,7); CHECK([(JFUIController *)menu playback].positionTicks==3000000000LL);
+    [mock emit:@"paused" ticks:3000000000LL]; WaitTitle(controller,@"paused");
+    CHECK([[menu titleForRow:0] isEqual:@"Resume"]);
     Press(controller,1); WaitTitle(controller,@"Media");
     CHECK([[(JFUIController *)menu playback].currentState isEqual:@"stopped"]);
     Choose(controller,0); WaitTitle(controller,@"Movie  1999");
-    CHECK([[menu titleForRow:4] isEqual:@"Resume"]);
-    Choose(controller,4); WaitTitle(controller,@"setup");
-    CHECK([(JFUIController *)menu playback].positionTicks==300000000);
+    CHECK([[menu titleForRow:0] containsString:@"Resume"]);
+    Choose(controller,0); WaitTitle(controller,@"setup");
+    CHECK([(JFUIController *)menu playback].positionTicks==3000000000LL);
+    ready=[NSDate dateWithTimeIntervalSinceNow:3];
+    while (mock.starts<2 && ready.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    CHECK(mock.starts==2); [mock emit:@"failure" ticks:0]; WaitTitle(controller,@"Movie  1999");
+    CHECK([[(JFUIController *)menu playback].currentState isEqual:@"failed"]);
+    Choose(controller,0); WaitTitle(controller,@"setup");
     ready=[NSDate dateWithTimeIntervalSinceNow:3];
     while (mock.starts<3 && ready.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-    CHECK(mock.starts==3); [mock emit:@"failure" ticks:0]; WaitTitle(controller,@"Movie  1999");
-    CHECK([[menu titleForRow:4] isEqual:@"Retry playback"]);
-    CHECK([[menu titleForRow:5] containsString:@"Playback failed"]);
-    Choose(controller,4); WaitTitle(controller,@"setup");
-    ready=[NSDate dateWithTimeIntervalSinceNow:3];
-    while (mock.starts<4 && ready.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-    CHECK(mock.starts==4); [mock emit:@"started" ticks:300000000]; WaitTitle(controller,@"playing");
+    CHECK(mock.starts==3); [mock emit:@"started" ticks:3000000000LL]; WaitTitle(controller,@"playing");
     CHECK([[(JFUIController *)menu playback].currentState isEqual:@"playing"]);
     [controller wasPopped]; CHECK([[(JFUIController *)menu playback] currentState]==nil);
     [menu release]; [controller release]; [mock release];
@@ -629,12 +669,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     controller=[[objc_getClass("JellyfinController") alloc] init]; [controller controlWasActivated];
     menu=[controller.list.datasource retain];
     Enter(controller,0,@"https://fixture.invalid/tls"); Enter(controller,1,@"user"); Enter(controller,2,@"secret");
-    WaitTitle(controller,@"RetroReel3"); CHECK([[menu titleForRow:5] containsString:@"certificate"]);
+    WaitTitle(controller,@"Jellyfin"); CHECK([[menu titleForRow:5] containsString:@"certificate"]);
     JFSession *oldSession=[[menu valueForKey:@"session"] retain]; CHECK(oldSession!=nil);
     Enter(controller,0,@"https://fixture.invalid/disconnect");
     CHECK(oldSession.closed && [menu valueForKey:@"session"]==nil); [oldSession release];
     Enter(controller,2,@"secret");
-    WaitTitle(controller,@"RetroReel3"); CHECK([[menu titleForRow:5] containsString:@"network"]);
+    WaitTitle(controller,@"Jellyfin"); CHECK([[menu titleForRow:5] containsString:@"network"]);
     [controller wasPopped]; [menu release]; [controller release];
     // Raw Apple Remote events exercise the actual runtime controller override.
     multiLibraries=YES;
@@ -652,10 +692,20 @@ int main(int argc, char **argv) { @autoreleasepool {
     Press(controller,1); CHECK(pops==afterEditors); // busy root Menu is consumed
     WaitTitle(controller,@"Libraries");
     CHECK([menu itemCount]==4);
-    Press(controller,4); WaitTitle(controller,@"Libraries"); CHECK(controller.list.selection==1);
-    Press(controller,4); CHECK(controller.list.selection==2); // refresh action
-    Press(controller,3); CHECK(controller.list.selection==1);
-    Press(controller,3); WaitTitle(controller,@"Libraries"); CHECK(controller.list.selection==0); // Shows
+    // Async selection must stay on the requested library while its rows
+    // are disabled for loading; previous code reset it to item 0 (Archived).
+    Press(controller,7);CHECK(controller.list.selection==1);
+    CHECK(Send(controller,5,1));CHECK(controller.list.selection==1);
+    WaitTitle(controller,@"Media");
+    Press(controller,1);WaitTitle(controller,@"Libraries");
+    Press(controller,6);CHECK(controller.list.selection==0);
+    // Two-column Libraries: left card -> Refresh, right card -> Sign out.
+    Press(controller,7); WaitTitle(controller,@"Libraries"); CHECK(controller.list.selection==1);
+    Press(controller,3); CHECK(controller.list.selection==3); // Sign out
+    Press(controller,6); CHECK(controller.list.selection==2); // Refresh
+    Press(controller,7); CHECK(controller.list.selection==3); // Sign out
+    Press(controller,4); CHECK(controller.list.selection==1); // Right card
+    Press(controller,6); CHECK(controller.list.selection==0); // Shows
     // Reproduce 12H1006 dropping Select release across a page change: the
     // next physical press must still be treated as a fresh press.
     CHECK(Send(controller,5,1)); WaitTitle(controller,@"Media");
@@ -688,9 +738,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     CGSize episodePosterSize=TestImagePixelSize([(UIImage *)[(UIPreview *)episodePosterPreview image] data]);
     CHECK(episodePosterSize.width==3 && episodePosterSize.height==3);
     Press(controller,5); WaitTitle(controller,@"S01E02  Episode");
-    CHECK([[menu titleForRow:0] isEqual:@"2020  •  45 min  •  7.9/10  •  TV-14"]);
-    CHECK([[menu titleForRow:1] isEqual:@"Drama"]);
-    CHECK([[menu titleForRow:2] isEqual:@"Detail"]);
+    CHECK([[menu titleForRow:0] isEqual:@"Play"]);
+    CHECK([[menu titleForRow:1] containsString:@"watched"] ||
+          [[menu titleForRow:1] containsString:@"Watched"]);
+    CHECK([[menu titleForRow:[menu itemCount]-1] isEqual:@"Information"]);
     id episodeDetailPreview=[controller previewControlForItem:0];
     CHECK([episodeDetailPreview isKindOfClass:objc_getClass("BRAsyncImageControl")]);
     CHECK([[(UIPreview *)episodeDetailPreview image] isKindOfClass:objc_getClass("ATVImage")]);
@@ -701,14 +752,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     emptySeasons=YES;
     Choose(controller,0); WaitTitle(controller,@"Media");
     Choose(controller,0); WaitTitle(controller,@"Seasons");
-    CHECK([menu itemCount]==2 && [[menu titleForRow:0] isEqual:@"No seasons available"] && ![menu rowSelectable:0]);
+    CHECK([menu itemCount]==3 && [[menu titleForRow:0] isEqual:@"No seasons available"] && ![menu rowSelectable:0]);
     Choose(controller,1); WaitTitle(controller,@"Media");
     Choose(controller,1); WaitTitle(controller,@"Libraries");
     emptySeasons=NO; emptyEpisodes=YES;
     Choose(controller,0); WaitTitle(controller,@"Media");
     Choose(controller,0); WaitTitle(controller,@"Seasons");
     Choose(controller,0); WaitTitle(controller,@"Episodes");
-    CHECK([menu itemCount]==2 && [[menu titleForRow:0] isEqual:@"No episodes available"] && ![menu rowSelectable:0]);
+    CHECK([menu itemCount]==3 && [[menu titleForRow:0] isEqual:@"No episodes available"] && ![menu rowSelectable:0]);
     Choose(controller,1); WaitTitle(controller,@"Seasons");
     Choose(controller,1); WaitTitle(controller,@"Media");
     Choose(controller,1); WaitTitle(controller,@"Libraries");
@@ -750,5 +801,37 @@ int main(int argc, char **argv) { @autoreleasepool {
     while (until.timeIntervalSinceNow>0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:until];
     CHECK(!controller.list.datasource && controller.list.reloads==lastReload);
     [menu release]; [controller release];
+    // Regression: all 150 movies and Back are visible without a Load more row,
+    // and cursor navigation crosses the old 100-item boundary.
+    pagedMovies=YES; ResetConfiguration();
+    controller=[[objc_getClass("JellyfinController") alloc] init];
+    [controller controlWasActivated]; menu=[controller.list.datasource retain];
+    Enter(controller,0,@"http://fixture.invalid/jellyfin");
+    Enter(controller,1,@"测试用户");
+    Choose(controller,4); Enter(controller,2,@"p\"ass"); WaitTitle(controller,@"Libraries");
+    Choose(controller,0); WaitTitle(controller,@"Media");
+    // First screen becomes usable before the rest of the 150-item directory.
+    CHECK([menu itemCount]>=12 && [menu itemCount]<=152);
+    NSDate *allMovies=[NSDate dateWithTimeIntervalSinceNow:6.0];
+    while([menu itemCount]!=152 && allMovies.timeIntervalSinceNow>0)
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                               beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    CHECK([menu itemCount]==152 && [[menu titleForRow:100] hasPrefix:@"Film 100"] &&
+          [[menu titleForRow:150] isEqual:@"Back"] && [[menu titleForRow:151] isEqual:@"Search"]);
+    // First-row UP targets the Back/Search header, not the last poster row.
+    Press(controller,3); CHECK(controller.list.selection==150);
+    Press(controller,7); CHECK(controller.list.selection==151);
+    Press(controller,6); CHECK(controller.list.selection==150);
+    Press(controller,4); CHECK(controller.list.selection==0);
+    // 20 x Down = 100 media positions in the new five-column grid.
+    for(int i=0;i<20;i++) CHECK([menu handleEvent:@{@"button":@(JFDown),@"phase":@"press"}]==JFHostEventConsumed);
+    CHECK(controller.list.selection==100 && [menu rowSelectable:100]);
+    CHECK([menu handleEvent:@{@"button":@(JFUp),@"phase":@"press"}]==JFHostEventConsumed);
+    CHECK(controller.list.selection==95);
+    for(int i=0;i<11;i++) CHECK([menu handleEvent:@{@"button":@(JFDown),@"phase":@"press"}]==JFHostEventConsumed);
+    CHECK(controller.list.selection>=145 && controller.list.selection<150);
+    // Header buttons are reachable from top row; Back continues to work.
+    Choose(controller,150); WaitTitle(controller,@"Libraries");
+    [controller wasPopped]; [menu release]; [controller release];
     printf("PASS: %d UI runtime assertions\n",checks);
 } }

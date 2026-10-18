@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-// Data/selection policy only. No device subtitle support is asserted.
+// Subtitle metadata/selection policy: local SRT or offline-preprocess-required.
 NSArray *JFSubtitleTracks(NSArray *streams, NSError **error);
 NSArray *JFSubtitleTracksForSources(NSArray *sources, NSError **error);
 NSDictionary *JFSubtitleSelection(NSArray *tracks, NSInteger index, BOOL preserveStyling, NSError **error);

@@ -10,9 +10,10 @@ typedef NS_ENUM(NSInteger, JFPage) { JFLoginPage, JFLibrariesPage, JFLibraryPage
     NSMutableArray *_history;
     NSDictionary *_detail;
     NSString *_seriesID, *_parentID, *_mediaType;
-    NSUInteger _offset;
-    BOOL _hasMore;
     NSInteger _mediaIndex;
+    NSArray *_queuedLibraryMedia;
+    NSUInteger _nextLibraryOffset;
+    BOOL _libraryMore;
     NSInteger _index;
     JFPage _page;
 }
@@ -25,14 +26,19 @@ typedef NS_ENUM(NSInteger, JFPage) { JFLoginPage, JFLibrariesPage, JFLibraryPage
 - (BOOL)authenticateToken:(NSString *)token error:(NSError **)error;
 - (NSString *)sessionToken;
 - (BOOL)refresh:(NSError **)error;
+- (BOOL)refreshUncached:(NSError **)error; // explicit user refresh forces live Jellyfin
 - (BOOL)handleEvent:(NSDictionary *)event;
 @property(nonatomic, readonly) NSArray *media;
 @property(nonatomic, readonly) NSDictionary *detail;
 @property(nonatomic, readonly) NSInteger mediaIndex;
-@property(nonatomic, readonly) BOOL hasMore;
 - (BOOL)openLibraryWithType:(NSString *)type error:(NSError **)error;
+// Display the first ten items immediately, then fill the list in background.
+- (BOOL)openFirstLibraryScreenWithType:(NSString *)type error:(NSError **)error;
+- (BOOL)appendNextLibraryChunk:(NSError **)error;
+@property(nonatomic, readonly) BOOL hasRemainingLibraryItems;
+- (void)focusLibraryAtIndex:(NSUInteger)index;
+- (BOOL)setDetailFlag:(NSString *)flag enabled:(BOOL)enabled error:(NSError **)error;
 - (BOOL)openMediaAtIndex:(NSUInteger)index error:(NSError **)error;
-- (BOOL)loadMore:(NSError **)error;
 - (BOOL)goBack;
 // Copy of model state suitable for main-thread delivery via JFWorker.
 - (NSDictionary *)snapshot;

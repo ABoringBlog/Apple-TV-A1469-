@@ -94,7 +94,7 @@ static id SyntheticApplianceInfo(void) {
     if (!Signature(info,init,@encode(id),@[@"@"])) { [info release]; return nil; }
     NSMutableDictionary *values=[NSMutableDictionary dictionary];
     [values setObject:@"jellyfin" forKey:@"FRApplianceIdentifier"];
-    [values setObject:@"RetroReel3" forKey:@"FRApplianceName"];
+    [values setObject:@"Jellyfin" forKey:@"FRApplianceName"];
     [values setObject:@5 forKey:@"FRAppliancePreferedOrderValue"];
     [values setObject:@"JellyfinAppliance" forKey:@"FRPrincipalClass"];
     [values setObject:@NO forKey:@"FRHideIfNoCategories"];
@@ -127,12 +127,39 @@ static id MenuInit(id self, SEL cmd) {
     }
     return self;
 }
+// Scoped BackRow screensaver suppression, based on the ATVSettingsFacade ABI.
+static BOOL appSaverHeld=NO;
+static NSInteger appSaverOriginal=0;
+static id AppSaverFacade(void) {
+    Class cls=objc_getClass("ATVSettingsFacade");
+    if(!cls || ![cls respondsToSelector:NSSelectorFromString(@"singleton")])return nil;
+    id settings=((id(*)(id,SEL))objc_msgSend)(cls,NSSelectorFromString(@"singleton"));
+    if(![settings respondsToSelector:NSSelectorFromString(@"screenSaverTimeout")] ||
+       ![settings respondsToSelector:NSSelectorFromString(@"setScreenSaverTimeout:")])return nil;
+    return settings;
+}
+static void AppSaverSet(BOOL inhibit) {
+    id settings=AppSaverFacade();if(!settings)return;
+    if(inhibit && !appSaverHeld) {
+        appSaverOriginal=((int(*)(id,SEL))objc_msgSend)(settings,NSSelectorFromString(@"screenSaverTimeout"));
+        appSaverHeld=YES;
+        ((void(*)(id,SEL,int))objc_msgSend)(settings,NSSelectorFromString(@"setScreenSaverTimeout:"),-1);
+    } else if(!inhibit && appSaverHeld) {
+        ((void(*)(id,SEL,int))objc_msgSend)(settings,NSSelectorFromString(@"setScreenSaverTimeout:"),(int)appSaverOriginal);
+        appSaverHeld=NO;
+    }
+    if([settings respondsToSelector:NSSelectorFromString(@"flushDiskChanges")])
+        ((void(*)(id,SEL))objc_msgSend)(settings,NSSelectorFromString(@"flushDiskChanges"));
+}
+
 static void Activated(id self, SEL cmd) {
+    AppSaverSet(YES);
     ((void(*)(id,SEL))ControllerSuper(cmd))(self,cmd);
     JFBRMenu *menu=(JFBRMenu *)objc_getAssociatedObject(self,&menuKey);
     [menu activate];
 }
 static void Deactivated(id self, SEL cmd) {
+    AppSaverSet(NO);
     [objc_getAssociatedObject(self,&menuKey) deactivate];
     objc_setAssociatedObject(self,&remoteKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ((void(*)(id,SEL))ControllerSuper(cmd))(self,cmd);
@@ -157,7 +184,49 @@ static id Preview(id self, SEL cmd, long row) {
 static BOOL Event(id self,SEL cmd,id event) {
     if (![NSThread isMainThread]) return NO;
     NSInteger action,value,origin;
-    if (Integer(event,@"originator","I",&origin) && origin==1 && Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
+    if (Integer(event,@"originator","I",&origin) && Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
+        JFPosterTrace([NSString stringWithFormat:@"REMOTE_PROBE origin=%ld action=%ld value=%ld",(long)origin,(long)action,(long)value]);
+    }
+    // Network DMAP sends synthesized clicks. Route to Jellyfin's model-owned
+    // focus and selection; BackRow's native visual focus is not the model index.
+    if (Integer(event,@"originator","I",&origin) && (origin==1 || origin==3) &&
+        Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
+        NSInteger b=0;
+        switch(action) { case 1:b=JFMenu;break; case 3:b=JFUp;break;
+            case 4:b=JFDown;break; case 5:b=JFSelect;break;
+            case 6:b=JFLeft;break; case 7:b=JFRight;break; default:break; }
+        if (action==5 && value==1) {
+            id list=JFBRObject(self,@"list");
+            for (NSString *method in @[@"selection",@"selectedIndex",@"selectedRow"]) {
+                NSMethodSignature *sig=[list methodSignatureForSelector:NSSelectorFromString(method)];
+                if (!sig || sig.numberOfArguments!=2) continue;
+                const char *type=sig.methodReturnType;
+                if (strcmp(type,@encode(long)) && strcmp(type,@encode(int)) && strcmp(type,@encode(NSInteger))) continue;
+                NSInvocation *inv=[NSInvocation invocationWithMethodSignature:sig];
+                inv.target=list; inv.selector=NSSelectorFromString(method); [inv invoke];
+                long index=0;
+                if (!strcmp(type,@encode(int))) {int v=0; [inv getReturnValue:&v];index=v;}
+                else [inv getReturnValue:&index];
+                JFPosterTrace([NSString stringWithFormat:@"NATIVE_FOCUS method=%@ index=%ld",method,index]);
+                if ([method isEqualToString:@"selection"] && index>=0) {
+                    JFUIController *ui=(JFUIController *)objc_getAssociatedObject(self,&menuKey);
+                    [ui synchronizeNativeSelection:index];
+                    break;
+                }
+            }
+        }
+        if (b && (value==1 || (value==2 && (b==JFUp || b==JFDown)))) {
+            JFBRMenu *menu=objc_getAssociatedObject(self,&menuKey);
+            JFHostEventResult result=menu ? [menu handleEvent:@{@"button":@(b),@"phase":value==2 ? @"repeat" : @"press"}] : JFHostEventUnhandled;
+            if (result==JFHostEventConsumed) return YES;
+            if (result==JFHostEventExitRequested && b==JFMenu) {
+                Method native=class_getInstanceMethod(class_getSuperclass(objc_getClass("JellyfinController")),cmd);
+                return native ? ((BOOL(*)(id,SEL,id))method_getImplementation(native))(self,cmd,event) : NO;
+            }
+        }
+        if (b) return YES;
+    }
+    if (Integer(event,@"originator","I",&origin) && (origin==1 || origin==3) && Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
         JFRemote *remote=objc_getAssociatedObject(self,&remoteKey);
         if (!remote) { remote=[[[JFRemote alloc] init] autorelease]; objc_setAssociatedObject(self,&remoteKey,remote,OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
         NSDictionary *e=[remote action:action value:value time:[NSProcessInfo processInfo].systemUptime];
@@ -189,7 +258,7 @@ static id Categories(id self,SEL cmd) {
     Class c=objc_getClass("BRApplianceCategory"); SEL s=NSSelectorFromString(@"categoryWithName:identifier:preferredOrder:");
     NSInvocation *v=[NSInvocation invocationWithMethodSignature:[c methodSignatureForSelector:s]];
     [v setTarget:c]; [v setSelector:s];
-    id name=@"RetroReel3",identifier=@"jellyfin"; float order=0.0f;
+    id name=@"Jellyfin",identifier=@"jellyfin"; float order=0.0f;
     [v setArgument:&name atIndex:2]; [v setArgument:&identifier atIndex:3]; [v setArgument:&order atIndex:4];
     [v invoke]; id result=nil; [v getReturnValue:&result];
     return result ? @[result] : @[];
@@ -279,20 +348,13 @@ static id JFMerchantInfoValueForKey(id self, SEL cmd, id key) {
         ([key isEqualToString:@"menu-icon-url"] || [key isEqualToString:@"menu-icon-url-version"]) &&
         JFIsJellyfinMerchantInfo(self)) {
         if ([key isEqualToString:@"menu-icon-url"]) {
-            id rawURL=JFBRObject(self,@"menuIconURL");
-            NSString *url=nil;
-            if ([rawURL isKindOfClass:[NSString class]]) url=rawURL;
-            else if ([rawURL isKindOfClass:[NSURL class]]) url=[rawURL absoluteString];
-            else if ([rawURL respondsToSelector:@selector(absoluteString)]) url=[rawURL absoluteString];
-            if (!url.length) {
-                return nil;
-            }
-            NSDictionary *urls=@{
+            NSString *url=JFMenuIconURL();
+            if (!url.length) return nil;
+            return @{
                 @"720":url, @"1080":url,
                 [NSNumber numberWithInteger:720]:url,
                 [NSNumber numberWithInteger:1080]:url
             };
-            return urls;
         }
         if ([key isEqualToString:@"menu-icon-url-version"]) {
             NSBundle *bundle=[NSBundle bundleWithIdentifier:@"org.jellyfin.atv3"];
@@ -306,22 +368,26 @@ static id JFMerchantInfoValueForKey(id self, SEL cmd, id key) {
 static BOOL JFInstallMerchantInfoKVCBridge(void) {
     Class cls=objc_getClass("BLAppMerchantInfo");
     if (!cls) { return NO; }
-    Class super=class_getSuperclass(cls);
+
     SEL sel=NSSelectorFromString(@"valueForKey:");
     Method inherited=class_getInstanceMethod(cls,sel);
-    Method superMethod=super ? class_getInstanceMethod(super,sel) : NULL;
-    if (!inherited || !superMethod) { return NO; }
+    if (!inherited) { return NO; }
+
     const char *encoding=method_getTypeEncoding(inherited);
     NSMethodSignature *sig=[NSMethodSignature signatureWithObjCTypes:encoding];
     if (strcmp([sig methodReturnType],@encode(id)) || [sig numberOfArguments]!=3 ||
         strcmp([sig getArgumentTypeAtIndex:2],@encode(id))) {
         return NO;
     }
-    jfSuperMerchantInfoValueForKey=method_getImplementation(superMethod);
-    if (!jfSuperMerchantInfoValueForKey) { return NO; }
-    if (!class_addMethod(cls,sel,(IMP)JFMerchantInfoValueForKey,encoding)) {
-        return NO;
-    }
+
+    IMP current=method_getImplementation(inherited);
+    if (!current) { return NO; }
+
+    if (current==(IMP)JFMerchantInfoValueForKey)
+        return YES;
+
+    jfSuperMerchantInfoValueForKey=current;
+    method_setImplementation(inherited,(IMP)JFMerchantInfoValueForKey);
     return YES;
 }
 static BOOL AddOverride(Class cls,NSString *name,IMP imp,const char *result,NSArray *args) {
@@ -334,6 +400,7 @@ static BOOL AddOverride(Class cls,NSString *name,IMP imp,const char *result,NSAr
 }
 BOOL JFRegisterBackRowClasses(void) {
     if (objc_getClass("JellyfinAppliance")) {
+        JFInstallMerchantInfoKVCBridge();
         JFInstallLegacyRootBridge();
         return YES;
     }

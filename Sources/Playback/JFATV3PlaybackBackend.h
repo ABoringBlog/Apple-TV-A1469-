@@ -10,11 +10,16 @@
     JFMediaGateway *_gateway;
     JFBackendEvent _event;
     long long _positionTicks, _lastTicks;
-    NSTimeInterval _ignoreNativeRateUntil;
-    BOOL _presented, _started, _stopping, _nativePaused;
+    long long _startBaselineTicks, _resumeBaselineTicks, _seekBaselineTicks;
+    NSTimeInterval _ignoreNativeRateUntil, _startRequestedAt, _resumeRequestedAt, _seekRequestedAt, _zeroPositionSince;
+    BOOL _presented, _started, _stopping, _nativePaused, _zeroPositionActive;
+    BOOL _verifiedNativePresentation;
+    BOOL _startProgressPending, _resumeProgressPending, _seekProgressPending;
 }
 + (BOOL)runtimeCompatible;
 - (id)initWithHostController:(id)controller;
+- (void)startRequest:(NSURLRequest *)request positionTicks:(long long)ticks
+          audioPlan:(NSDictionary *)plan event:(JFBackendEvent)event;
 - (BOOL)prepareRequest:(NSURLRequest *)request positionTicks:(long long)ticks error:(NSError **)error;
 - (void)discardPreparedPlayback;
 @property(nonatomic, readonly) BOOL prepared;

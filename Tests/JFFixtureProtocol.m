@@ -17,6 +17,14 @@ static NSString *RequestToken(NSURLRequest *r) {
     NSDictionary *routes=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@"Tests/media.json"] options:0 error:NULL];
     NSString *key=[r.URL query] ? [p stringByAppendingFormat:@"?%@",[r.URL query]] : p;
     NSDictionary *route=[routes objectForKey:key];
+    // Production first-screen browsing now requests 11 records rather than
+    // 101. Mirror the fixture's same server response at the smaller limit.
+    if(!route && [p isEqual:@"/jellyfin/Items"] &&
+       [key containsString:@"StartIndex=0&Limit=11"]) {
+        NSString *full=[key stringByReplacingOccurrencesOfString:@"Limit=11"
+                                                       withString:@"Limit=101"];
+        route=routes[full];
+    }
     if ([p hasSuffix:@"/PlaybackInfo"] && [r.HTTPMethod isEqual:@"POST"]) {
         body=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@"Tests/playback.json"] options:0 error:NULL];
         route=@{@"status":@200,@"body":body};

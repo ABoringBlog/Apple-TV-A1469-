@@ -13,9 +13,11 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>RetroReel3</string>
+	<string>Jellyfin</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.5.101</string>
 	<key>CFBundleSignature</key>
 	<string>fnrw</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -23,11 +25,11 @@
 		<string>iPhoneOS</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.5.85</string>
+	<string>0.5.101</string>
 	<key>FRApplianceDataSourceType</key>
 	<string>All</string>
 	<key>FRApplianceName</key>
-	<string>RetroReel3</string>
+	<string>Jellyfin</string>
 	<key>FRAppliancePreferedOrderValue</key>
 	<integer>5</integer>
 	<key>FRHideIfNoCategories</key>

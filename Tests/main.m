@@ -90,7 +90,7 @@ static int popped;
 int main(int argc,char **argv) { @autoreleasepool {
     NSDictionary *addresses=@{
         @"  HTTPS://Example.COM:443/jellyfin///  ":@"https://example.com/jellyfin",
-        @"http://192.0.2.2:8096/jellyfin/":@"http://192.0.2.2:8096/jellyfin",
+        @"http://192.168.1.2:8096/jellyfin/":@"http://192.168.1.2:8096/jellyfin",
         @"example.com:8920/base/path/":@"https://example.com:8920/base/path",
         @"http://localhost:80/":@"http://localhost",
         @"https://[::1]:8920/jellyfin/":@"https://[::1]:8920/jellyfin",
@@ -268,44 +268,56 @@ int main(int argc,char **argv) { @autoreleasepool {
     CHECK([browser handleEvent:@{@"button":@(JFMenu),@"phase":@"press"}] && browser.page==JFEpisodesPage);
     CHECK([browser goBack] && browser.page==JFSeasonsPage);
     CHECK([browser goBack] && browser.page==JFMediaPage);
-    CHECK([browser loadMore:&error] && !error && !browser.hasMore);
     [browser logout]; CHECK(browser.media.count==0 && !browser.detail && ![browser goBack]);
     CHECK([c login:@"测试用户" password:@"p\"ass" error:&error]);
     nc.expired=NO; nc.failed=NO; nc.totalItems=101; CHECK([nav refresh:&error]);
-    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==100 && nav.hasMore);
-    CHECK([nav openMediaAtIndex:3 error:&error] && nav.page==JFDetailPage);
-    CHECK([nav goBack] && nav.mediaIndex==3 && nav.hasMore);
-    nc.failed=YES;
-    CHECK(![nav loadMore:&error] && error.code==500 && nav.media.count==100 && nav.hasMore);
-    CHECK(![nav openMediaAtIndex:2 error:&error] && nav.mediaIndex==3 && nav.page==JFMediaPage);
-    nc.failed=NO;
-    CHECK([nav loadMore:&error] && nav.media.count==101 && !nav.hasMore && nav.mediaIndex==3);
     NSUInteger requests=nc.pageRequests;
-    CHECK([nav loadMore:&error] && nc.pageRequests==requests);
-
-    // Look-ahead pagination: exactly 100 records has no phantom Load more.
+    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==101);
+    CHECK(nc.pageRequests==requests+2); // 101-item lookahead, then final page.
+    CHECK([nav openMediaAtIndex:100 error:&error] && nav.page==JFDetailPage);
+    CHECK([nav goBack] && nav.mediaIndex==100 && nav.media.count==101);
     CHECK([nav goBack]); // Media -> Libraries
+    nc.failed=YES;
+    CHECK(![nav openLibraryWithType:@"Movie" error:&error] && error.code==500);
+    CHECK(nav.page==JFLibrariesPage && nav.media.count==0);
+    nc.failed=NO;
+
+    // A library with exactly 100 records has no second request or hidden items.
     nc.totalItems=100; nc.overlapPages=NO;
-    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==100 && !nav.hasMore);
-    requests=nc.pageRequests; CHECK([nav loadMore:&error] && nc.pageRequests==requests);
+    requests=nc.pageRequests;
+    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==100);
+    CHECK(nc.pageRequests==requests+1);
     CHECK([nav goBack]);
 
-    // Series uses the same stable page contract.
+    // Series is also fully assembled before exposing the list.
     nc.totalItems=101;
-    CHECK([nav openLibraryWithType:@"Series" error:&error] && nav.media.count==100 && nav.hasMore);
-    CHECK([nav.media[0][@"Type"] isEqual:@"Series"]);
-    CHECK([nav loadMore:&error] && nav.media.count==101 && !nav.hasMore);
+    CHECK([nav openLibraryWithType:@"Series" error:&error] && nav.media.count==101);
+    CHECK([nav.media[100][@"Type"] isEqual:@"Series"]);
     CHECK([nav goBack]);
 
-    // Tolerate a server page overlapping the prior page by one item.
+    // The final complete list deduplicates overlapping server pages.
     nc.totalItems=201; nc.overlapPages=YES;
-    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==100 && nav.hasMore);
-    CHECK([nav loadMore:&error] && nav.media.count==199 && nav.hasMore);
-    CHECK([nav loadMore:&error] && nav.media.count==201 && !nav.hasMore);
+    requests=nc.pageRequests;
+    CHECK([nav openLibraryWithType:@"Movie" error:&error] && nav.media.count==201);
+    CHECK(nc.pageRequests==requests+3);
     NSMutableSet *pageIDs=[NSMutableSet set];
     for (NSDictionary *item in nav.media) [pageIDs addObject:item[@"Id"]];
     CHECK(pageIDs.count==nav.media.count);
     nc.overlapPages=NO;
+    // Progressive grid: publish only first visible ten movies, then deliver
+    // additional pages without losing IDs, sort order, or back navigation.
+    CHECK([nav goBack] && nav.page==JFLibrariesPage);
+    requests=nc.pageRequests;
+    CHECK([nav openFirstLibraryScreenWithType:@"Movie" error:&error]);
+    CHECK(nav.page==JFMediaPage && nav.media.count==10 && nav.hasRemainingLibraryItems);
+    CHECK(nc.pageRequests==requests+1);
+    CHECK([nav appendNextLibraryChunk:&error] && nav.media.count==110);
+    CHECK([nav appendNextLibraryChunk:&error] && nav.media.count==201);
+    CHECK(!nav.hasRemainingLibraryItems && ![nav appendNextLibraryChunk:&error]);
+    CHECK([nav.media[200][@"Id"] isEqual:@"movie200"]);
+    CHECK([nav goBack] && nav.page==JFLibrariesPage);
+    // Restore the Media navigation state expected by the next auth expiry test.
+    CHECK([nav openLibraryWithType:@"Movie" error:&error]);
 
     nc.expired=YES;
     CHECK(![nav openMediaAtIndex:0 error:&error] && error.code==401 && nav.page==JFLoginPage && !nav.media.count && ![nav goBack]);
@@ -371,6 +383,40 @@ int main(int argc,char **argv) { @autoreleasepool {
     NSArray *files=[[NSFileManager defaultManager] contentsOfDirectoryAtPath:cachePath error:NULL];
     CHECK(files.count==1 && [files[0] length]==64);
     [cache invalidate]; CHECK(![cache dataForKey:@"test-key"]);
+    // Persistent 1 GiB ATV cache: stable lookups across distinct instances,
+    // fixed on-disk priority names, and same-pool JSON metadata.
+    NSString *poolPath=[cachePath stringByAppendingString:@"-persistent"];
+    JFImageCache *pool=[[[JFImageCache alloc]initPersistentWithDirectory:poolPath capacityBytes:1024ULL*1024*1024] autorelease];
+    CHECK(pool);
+    [pool storeData:pixel forKey:@"cover" priority:0];
+    [pool storeData:pixel forKey:@"archivedBackdrop" priority:2];
+    NSData *summary=[@"{\"Items\":[]}" dataUsingEncoding:NSUTF8StringEncoding];
+    [pool storeMetadata:summary forKey:@"metadata"];
+    files=[[NSFileManager defaultManager] contentsOfDirectoryAtPath:poolPath error:NULL];
+    NSUInteger covers=0,archived=0,metadata=0;
+    for(NSString *entry in files) {
+        if(entry.length==65 && [entry hasPrefix:@"0"])covers++;
+        if(entry.length==65 && [entry hasPrefix:@"2"])archived++;
+        if(entry.length==66 && [entry hasPrefix:@"3m"])metadata++;
+    }
+    CHECK(covers==1 && archived==1 && metadata==1);
+    JFImageCache *reopened=[[[JFImageCache alloc]initPersistentWithDirectory:poolPath capacityBytes:1024ULL*1024*1024] autorelease];
+    CHECK([[reopened dataForKey:@"cover"] isEqual:pixel]);
+    CHECK([[reopened dataForKey:@"archivedBackdrop"] isEqual:pixel]);
+    CHECK([[reopened metadataForKey:@"metadata"] isEqual:summary]);
+    CHECK([[reopened freshMetadataForKey:@"metadata" maxAge:3600] isEqual:summary]);
+    NSString *metadataPath=nil;
+    for(NSString *name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:poolPath error:NULL])
+        if([name hasPrefix:@"3m"]){metadataPath=[poolPath stringByAppendingPathComponent:name];break;}
+    CHECK(metadataPath!=nil);
+    [[NSFileManager defaultManager] setAttributes:@{
+        NSFileModificationDate:[NSDate dateWithTimeIntervalSinceNow:-5400]}
+        ofItemAtPath:metadataPath error:NULL];
+    CHECK([reopened freshMetadataForKey:@"metadata" maxAge:3600]==nil);
+    CHECK([[reopened freshMetadataForKey:@"metadata" maxAge:14400] isEqual:summary]);
+    CHECK([[reopened freshMetadataForKey:@"metadata" maxAge:86400] isEqual:summary]);
+    [pool invalidate];CHECK([[reopened dataForKey:@"cover"] isEqual:pixel]);
+    [[NSFileManager defaultManager] removeItemAtPath:poolPath error:NULL];
     CHECK([c login:@"测试用户" password:@"p\"ass" error:&error]);
     CHECK([[c imageData:@"movie1" backdrop:NO width:320 cache:cache error:&error] isEqual:pixel] && !error);
     CHECK([[c imageData:@"movie1" backdrop:NO width:320 cache:cache error:&error] isEqual:pixel]);

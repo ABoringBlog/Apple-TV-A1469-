@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-@class JFClient, JFWorker, JFTask, JFPlaybackDelivery;
+@class JFClient, JFWorker, JFTask, JFPlaybackDelivery, JFLocalSubtitleOverlay;
 // Every backend callback and command runs on main. The 12H1006 native adapter is runtime-gated.
 typedef void (^JFBackendEvent)(NSString *event, long long ticks);
 @protocol JFPlaybackBackend <NSObject>
@@ -17,6 +17,15 @@ extern NSString * const JFPlaybackChanged;
     JFPlaybackDelivery *_delivery;
     id<JFPlaybackBackend> _backend;
     NSDictionary *_plan;
+    NSURLRequest *_macAudioRequest;
+    JFTask *_subtitleTask;
+    NSArray *_subtitleCues;
+    JFLocalSubtitleOverlay *_subtitleOverlay;
+    NSString *_subtitleItemID, *_subtitleSourceID;
+    NSInteger _subtitleIndex;
+    NSUInteger _subtitleGeneration;
+    NSUInteger _subtitleAttachAttempts;
+    long long _lastMacAudioSync;
     NSString *_state, *_errorKind;
     NSUInteger _generation;
     long long _position;
@@ -35,11 +44,15 @@ extern NSString * const JFPlaybackChanged;
 - (BOOL)playItem:(NSString *)item startTicks:(long long)ticks;
 - (BOOL)playItem:(NSString *)item startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex;
 - (BOOL)playItem:(NSString *)item startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex;
+- (BOOL)selectLocalSubtitleForItem:(NSString *)item mediaSourceID:(NSString *)source index:(NSInteger)index;
 // Returns a locally retained resume point only when it belongs to this exact item and is inside duration.
 - (long long)resumeTicksForItem:(NSString *)item;
+// Active playback's negotiated source; only valid on main thread while playing/paused.
+- (NSString *)currentMediaSourceID;
 - (BOOL)pause;
 - (BOOL)resume;
 - (BOOL)seek:(long long)ticks;
+- (BOOL)seekBySeconds:(NSInteger)seconds; // bounded relative step; never overflow duration
 - (BOOL)stop;
 - (void)invalidateSession;
 - (void)close;

@@ -4,14 +4,53 @@
 #import "Playback/JFPlaybackModel.h"
 #import "Playback/JFPlaybackTrace.h"
 #import "Playback/JFSubtitle.h"
+#import "Playback/JFLocalSubtitle.h"
+#import <CommonCrypto/CommonDigest.h>
+
 #include <math.h>
+// A credential-free Mac artwork cache. This request NEVER carries Jellyfin
+// Authentication headers, session tokens or item metadata.
+static NSDictionary *JFMacArtworkConfig(void) {
+    NSUserDefaults *d=[[[NSUserDefaults alloc] initWithSuiteName:@"org.jellyfin.atv3"] autorelease];
+    NSString *url=[d stringForKey:@"ArtworkCacheURL"],*secret=[d stringForKey:@"ArtworkCacheSecret"];
+    if (![url isKindOfClass:[NSString class]] || ![secret isKindOfClass:[NSString class]] ||
+        secret.length!=64) return nil;
+    NSCharacterSet *hex=[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+    if ([secret rangeOfCharacterFromSet:hex].location!=NSNotFound) return nil;
+    NSURLComponents *parsed=[NSURLComponents componentsWithString:url];
+    NSString *host=parsed.host;
+    if (![parsed.scheme isEqual:@"http"] || [parsed.port integerValue]!=49268 ||
+        parsed.user || parsed.password || parsed.query || parsed.fragment ||
+        !host.length || ![parsed.path isEqualToString:@""] ) return nil;
+    NSArray *octets=[host componentsSeparatedByString:@"."];
+    if(octets.count!=4) return nil;
+    for(NSString *octet in octets) {
+        if(octet.length>3 || !octet.length ||
+           [octet rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location!=NSNotFound ||
+           [octet integerValue]>255) return nil;
+    }
+    NSInteger first=[octets[0] integerValue],second=[octets[1] integerValue];
+    BOOL privateAddress=first==10 || (first==172 && second>=16 && second<=31) ||
+                        (first==192 && second==168);
+    return privateAddress ? @{@"url":url,@"secret":secret} : nil;
+}
+static NSString *JFMacArtworkHash(NSURL *jellyfinURL, NSString *userID, NSString *path) {
+    if (!jellyfinURL || !userID || !path) return nil;
+    NSString *string=[NSString stringWithFormat:@"%@|%@|%@",jellyfinURL.absoluteString,userID,path];
+    NSData *bytes=[string dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes,(CC_LONG)bytes.length,hash);
+    NSMutableString *result=[NSMutableString stringWithCapacity:64];
+    for (NSUInteger k=0;k<sizeof(hash);k++) [result appendFormat:@"%02x",hash[k]];
+    return result;
+}
 static id Fail(NSError **error, NSInteger code, NSString *message) {
     if (error) *error = [NSError errorWithDomain:@"Jellyfin" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
     return nil;
 }
 static BOOL String(id value) { return [value isKindOfClass:[NSString class]] && [value length] > 0; }
 static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
-    NSString *base=[NSString stringWithFormat:@"MediaBrowser Client=\"RetroReel3\", Device=\"Apple TV 3\", DeviceId=\"%@\", Version=\"0.5.22\"",deviceID];
+    NSString *base=[NSString stringWithFormat:@"MediaBrowser Client=\"Jellyfin ATV3\", Device=\"Apple TV 3\", DeviceId=\"%@\", Version=\"0.5.22\"",deviceID];
     return token ? [base stringByAppendingFormat:@", Token=\"%@\"",token] : base;
 }
 // Per-request delegate: reject redirects so credentials cannot cross origins.
@@ -33,6 +72,7 @@ static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
 - (void)dealloc { [data release]; [response release]; [error release]; [super dealloc]; }
 @end
 @implementation JFClient
+@synthesize catalogNetworkOnly=_catalogNetworkOnly;
 - (NSTimeInterval)timeout { return _timeout; }
 - (void)setTimeout:(NSTimeInterval)value { _timeout=isfinite(value) ? fmin(300, fmax(0.05,value)) : 15; }
 - (id)initWithURL:(NSURL *)url deviceID:(NSString *)deviceID {
@@ -41,6 +81,10 @@ static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
         if (!address || !String(deviceID) || [deviceID rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"] invertedSet]].location!=NSNotFound) { [self release]; return nil; }
         _baseURL=[[NSURL URLWithString:[address stringByAppendingString:@"/"]] retain];
         _deviceID = [deviceID copy]; _timeout=15;
+#if defined(__arm__)
+        _metadataCache=[[JFImageCache alloc] initPersistentWithDirectory:
+            @"/var/mobile/Library/Caches/Jellyfin-ATV3/v1" capacityBytes:1024ULL*1024*1024];
+#endif
     } return self;
 }
 - (NSDictionary *)request:(NSString *)path body:(NSDictionary *)body error:(NSError **)outError {
@@ -51,8 +95,35 @@ static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
     [r setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     [r setValue:AuthorizationValue(_deviceID,_token) forHTTPHeaderField:@"Authorization"];
     if (body) { [r setHTTPMethod:@"POST"]; [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; NSData *d = [NSJSONSerialization dataWithJSONObject:body options:0 error:outError]; if (!d) return nil; [r setHTTPBody:d]; }
-    NSData *data=[self downloadRequest:r error:outError];
+    BOOL catalog=!body && _userID.length &&
+        ([path hasPrefix:@"Users/"] && ([path containsString:@"/Views"] || [path containsString:@"/Items"])) ;
+    catalog=catalog || (!body && _userID.length &&
+       ([path hasPrefix:@"Items?"] || [path hasPrefix:@"Shows/"] ||
+        ([path hasPrefix:@"Items/"] && [path rangeOfString:@"/Playback"].location==NSNotFound)));
+    NSString *metaKey=catalog?[NSString stringWithFormat:@"meta|%@|%@|%@",
+                       _baseURL.absoluteString,_userID,path]:nil;
+    // A recently authenticated, locally cached movie listing can enter
+    // instantly. Signed session login still goes to the live Jellyfin server.
+    // One-hour freshness limit lets newly added films appear automatically.
+    NSData *data=(!body && !_catalogNetworkOnly && [path hasPrefix:@"Items?"] &&
+                  _metadataCache && metaKey) ?
+        [_metadataCache freshMetadataForKey:metaKey maxAge:86400] : nil;
+    BOOL servedFromLocalCatalog=(data!=nil);
+    NSError *downloadError=nil;
+    if(!data)data=[self downloadRequest:r error:&downloadError];
+    if(!data && _metadataCache && metaKey &&
+       [downloadError.domain isEqual:NSURLErrorDomain] &&
+       downloadError.code!=NSURLErrorCancelled) {
+        // Only a transport outage permits offline catalog metadata.
+        // A 401/403/404/500 response NEVER bypasses Jellyfin authorization.
+        data=[_metadataCache metadataForKey:metaKey];
+    }
+    if(outError)*outError=data?nil:downloadError;
     if (!data) return nil;
+    // A cache HIT must be read-only: storing it again would rescan all
+    // ~1,400 files in the 1-GiB pool and delay every library entry.
+    if(metaKey && _metadataCache && data.length && !servedFromLocalCatalog)
+        [_metadataCache storeMetadata:data forKey:metaKey];
     if (!data.length && body) return @{}; // Jellyfin POST endpoints may return 204.
     id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:outError];
     if (!json) return nil;
@@ -76,19 +147,73 @@ static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
     return [[t->data copy] autorelease];
 }
 - (NSData *)imageData:(NSString *)identifier backdrop:(BOOL)backdrop width:(NSUInteger)width cache:(JFImageCache *)cache error:(NSError **)error {
+    return [self imageDataForID:identifier type:backdrop ? @"Backdrop" : @"Primary" width:width cache:cache error:error];
+}
+- (BOOL)hasLocalImageForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width cache:(JFImageCache *)cache {
+    if(![self hasSession] || !cache || !Identifier(identifier) || width<24 || width>2048)return NO;
+    NSString *suffix=[type isEqual:@"Backdrop"]?@"Backdrop/0":type;
+    if(![@[@"Primary",@"Thumb",@"Logo",@"Backdrop"] containsObject:type])return NO;
+    NSString *path=[NSString stringWithFormat:@"Items/%@/Images/%@?MaxWidth=%lu",
+                     identifier,suffix,(unsigned long)width];
+    NSString *key=[NSString stringWithFormat:@"%@|%@|%@",_baseURL.absoluteString,_userID,path];
+    return [cache containsImageForKey:key];
+}
+- (NSData *)imageDataForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width cache:(JFImageCache *)cache error:(NSError **)error {
+    NSUInteger priority=[@[@"Primary",@"Thumb"] containsObject:type]?0:
+        [type isEqual:@"Avatar"]?3:1;
+    return [self imageDataForID:identifier type:type width:width cache:cache priority:priority error:error];
+}
+- (NSData *)imageDataForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width cache:(JFImageCache *)cache priority:(NSUInteger)priority error:(NSError **)error {
     if (error) *error=nil;
-    NSURLRequest *request=backdrop ? [self backdropRequest:identifier width:width error:error] : [self posterRequest:identifier width:width error:error];
+    if (![self requireID:identifier error:error]) return nil;
+    if (width<1 || width>4096) return Fail(error,1007,@"Invalid image width");
+    NSString *path=nil;
+    if ([type isEqual:@"Avatar"] && [identifier isEqual:@"me"] && _userID)
+        path=[NSString stringWithFormat:@"Users/%@/Images/Primary?MaxWidth=%lu",_userID,(unsigned long)width];
+    else if ([@[@"Primary",@"Thumb",@"Backdrop",@"Logo"] containsObject:type]) {
+        NSString *imageType=[type isEqual:@"Backdrop"] ? @"Backdrop/0" : type;
+        path=[NSString stringWithFormat:@"Items/%@/Images/%@?MaxWidth=%lu",identifier,imageType,(unsigned long)width];
+    }
+    if (!path) return Fail(error,1007,@"Invalid image type or user");
+    NSURLRequest *request=[self assetRequest:path];
     if (!request) return nil;
     if (JFWorkCancelled()) return Fail(error,NSURLErrorCancelled,@"Request cancelled");
     if (cache) { if (!_imageCaches) _imageCaches=[NSMutableSet new]; [_imageCaches addObject:cache]; }
     // Session namespace prevents another login/server from reusing private cached images.
-    NSString *key=[_imageNamespace stringByAppendingString:request.URL.absoluteString];
+    NSString *key=_userID.length ?
+        [NSString stringWithFormat:@"%@|%@|%@",_baseURL.absoluteString,_userID,path] :
+        [_imageNamespace stringByAppendingString:request.URL.absoluteString];
     NSData *data=[cache dataForKey:key];
     if (data) return data;
+    NSDictionary *mac=JFMacArtworkConfig();
+    NSString *hash=mac ? JFMacArtworkHash(_baseURL,_userID,path) : nil;
+    NSURL *url=hash ? [NSURL URLWithString:[NSString stringWithFormat:@"%@/v1/art/%@",mac[@"url"],hash]] : nil;
+    if (url && !JFWorkCancelled()) {
+        NSMutableURLRequest *cacheGet=[NSMutableURLRequest requestWithURL:url
+              cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:0.65];
+        [cacheGet setHTTPShouldHandleCookies:NO];
+        [cacheGet setValue:mac[@"secret"] forHTTPHeaderField:@"X-JF-Art-Key"];
+        NSError *ignored=nil;
+        NSData *cached=[self downloadRequest:cacheGet error:&ignored];
+        if (JFValidImage(cached)) {
+            [cache storeData:cached forKey:key priority:priority];
+            return cached;
+        }
+    }
+    if (JFWorkCancelled()) return Fail(error,NSURLErrorCancelled,@"Request cancelled");
     data=[self downloadRequest:request error:error];
     if (!data) return nil;
     if (!JFValidImage(data)) return Fail(error,1009,@"Invalid or oversized image");
-    [cache storeData:data forKey:key];
+    [cache storeData:data forKey:key priority:priority];
+    // Store on the same artwork worker; cache failures never affect playback.
+    if(url && !JFWorkCancelled()) {
+        NSMutableURLRequest *put=[NSMutableURLRequest requestWithURL:url
+              cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:0.65];
+        [put setHTTPMethod:@"PUT"];[put setHTTPBody:data];
+        [put setHTTPShouldHandleCookies:NO];
+        [put setValue:mac[@"secret"] forHTTPHeaderField:@"X-JF-Art-Key"];
+        (void)[self downloadRequest:put error:NULL];
+    }
     return data;
 }
 - (NSURLRequest *)backdropRequest:(NSString *)identifier width:(NSUInteger)width error:(NSError **)error {
@@ -219,11 +344,14 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     NSDictionary *body=JFPlaybackBody(ticks,subtitleIndex);
     if (!body) return Fail(error,1007,@"Invalid playback parameters");
     NSMutableDictionary *request=[[body mutableCopy] autorelease]; request[@"UserId"]=_userID;
+// Fixed global 10 Mbps. Diagnostic exceptions retired.
+
     // Jellyfin applies stream indices against a pinned MediaSourceId.
     if (boundSource) request[@"MediaSourceId"]=source;
     if (hasAudio) request[@"AudioStreamIndex"]=@(audioIndex);
-    // No device subtitle renderer exists: selected subtitles require server burn-in.
-    if (subtitleIndex>=0) { request[@"EnableDirectPlay"]=@NO; request[@"EnableDirectStream"]=@NO; request[@"AlwaysBurnInSubtitleWhenTranscoding"]=@YES; }
+    // Legacy explicit-subtitle API fallback. The production player always negotiates
+    // video with index=-1 and renders selected SRT separately on the device.
+    if (subtitleIndex>=0) { request[@"EnableDirectPlay"]=@NO; request[@"EnableDirectStream"]=@NO; request[@"AllowVideoStreamCopy"]=@NO; request[@"AllowAudioStreamCopy"]=@NO; request[@"AlwaysBurnInSubtitleWhenTranscoding"]=@YES; }
     return [self request:[NSString stringWithFormat:@"Items/%@/PlaybackInfo",identifier] body:request error:error];
 }
 - (NSURLRequest *)playbackRequest:(NSDictionary *)plan error:(NSError **)error {
@@ -270,14 +398,17 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     NSSet *controlled=[NSSet setWithArray:@[@"api_key",@"access_token",@"token",@"mediasourceid",@"playsessionid",@"starttimeticks",@"audiostreamindex",@"subtitlestreamindex",@"videocodec",@"audiocodec",@"maxwidth",@"maxheight",@"maxframerate",@"videobitrate",@"audiobitrate",@"maxaudiochannels",@"audiocodec",@"profile",@"level",@"videobitdepth",@"allowvideostreamcopy",@"allowaudiostreamcopy",@"requireavc",@"videorangetype",@"segmentlength"]];
     for (NSURLQueryItem *item in parts.queryItems) if (![controlled containsObject:item.name.lowercaseString]) [query addObject:item];
     BOOL copy=[method isEqual:@"DirectStream"];
+    BOOL hasBurnInSubtitle=JFTicks(plan[@"subtitleStreamIndex"]) && [plan[@"subtitleStreamIndex"] integerValue]>=0;
+    BOOL videoCopy=copy || (!hasBurnInSubtitle && [plan[@"allowVideoCopy"] boolValue]);
+    BOOL audioCopy=copy;
     long long duration=[plan[@"durationTicks"] longLongValue];
     NSString *segmentLength=(duration>0 && duration<=108000000000LL) ? @"3" : @"6"; // 3 hours.
     // Dynamic HLS segment endpoints reject StartTimeTicks. Resume is applied by the native player
     // after cue via setElapsedTime:, so keep HLS segment URLs free of StartTimeTicks.
     NSMutableDictionary *values=[NSMutableDictionary dictionaryWithDictionary:@{@"MediaSourceId":plan[@"sourceID"],@"PlaySessionId":plan[@"playSessionID"],
-        @"VideoCodec":copy ? @"copy" : @"h264",@"AudioCodec":copy ? @"copy" : @"aac",@"MaxWidth":@"1920",@"MaxHeight":@"1080",@"MaxFramerate":@"30",
+        @"VideoCodec":videoCopy ? @"copy" : @"h264",@"AudioCodec":audioCopy ? @"copy" : @"aac",@"MaxWidth":@"1920",@"MaxHeight":@"1080",@"MaxFramerate":@"30",
         @"VideoBitrate":@"8000000",@"AudioBitrate":@"192000",@"MaxAudioChannels":@"2",@"Profile":@"high",@"Level":@"40",@"VideoBitDepth":@"8",@"VideoRangeType":@"SDR",
-        @"AllowVideoStreamCopy":copy ? @"true" : @"false",@"AllowAudioStreamCopy":copy ? @"true" : @"false",@"RequireAvc":@"true",@"SegmentLength":segmentLength}];
+        @"AllowVideoStreamCopy":videoCopy ? @"true" : @"false",@"AllowAudioStreamCopy":audioCopy ? @"true" : @"false",@"RequireAvc":@"true",@"SegmentLength":segmentLength}];
     if (JFTicks(plan[@"audioStreamIndex"]) && [plan[@"audioStreamIndex"] integerValue]>=0 && [plan[@"audioStreamIndex"] integerValue]<=10000)
         values[@"AudioStreamIndex"]=[plan[@"audioStreamIndex"] stringValue];
     if (JFTicks(plan[@"subtitleStreamIndex"]) && [plan[@"subtitleStreamIndex"] integerValue]>=0 && [plan[@"subtitleStreamIndex"] integerValue]<=10000)
@@ -285,6 +416,17 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     for (NSString *key in [[values allKeys] sortedArrayUsingSelector:@selector(compare:)]) [query addObject:[NSURLQueryItem queryItemWithName:key value:values[key]]];
     parts.queryItems=query;
     return [self assetRequest:parts.URL.absoluteString];
+}
+- (BOOL)setUserFlag:(NSString *)flag item:(NSString *)identifier enabled:(BOOL)enabled error:(NSError **)error {
+    if (![self requireID:identifier error:error] || ![@[@"Played",@"Favorite"] containsObject:flag]) return NO;
+    NSString *endpoint=[flag isEqual:@"Played"] ? @"PlayedItems" : @"FavoriteItems";
+    NSString *path=[NSString stringWithFormat:@"Users/%@/%@/%@",_userID,endpoint,identifier];
+    NSMutableURLRequest *request=[[self assetRequest:path] mutableCopy];
+    [request setHTTPMethod:enabled ? @"POST" : @"DELETE"];
+    // Jellyfin returns an updated UserItemData object or HTTP 204.
+    NSData *response=[self downloadRequest:request error:error];
+    [request release];
+    return response!=nil;
 }
 - (BOOL)reportPlayback:(NSString *)event body:(NSDictionary *)body error:(NSError **)error {
     if (![@[@"Playing",@"Progress",@"Stopped"] containsObject:event] || ![body isKindOfClass:[NSDictionary class]] ||
@@ -301,8 +443,17 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     NSURLRequest *request=[self subtitleRequest:item mediaSource:source index:index error:error];
     if (!request) return nil;
     NSData *data=[self downloadRequest:request error:error];
-    if (!data || !JFSubtitleText(data,error)) return nil;
+    // Client sidecar SRT is parsed locally; tolerate isolated malformed/zero-length
+    // cues rather than rejecting an entire otherwise-valid subtitle file.
+    if (!data || !JFLocalSubtitleParse(data,error)) return nil;
     return data;
+}
+- (NSArray *)localSubtitleCues:(NSString *)item mediaSource:(NSString *)source index:(NSInteger)index error:(NSError **)error {
+    NSURLRequest *request=[self subtitleRequest:item mediaSource:source index:index error:error];
+    if (!request) return nil;
+    NSData *data=[self downloadRequest:request error:error];
+    if (!data || JFWorkCancelled()) return nil;
+    return JFLocalSubtitleParse(data,error);
 }
 - (NSURLRequest *)assetRequest:(NSString *)path {
     NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:path relativeToURL:_baseURL] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:_timeout];
@@ -346,5 +497,5 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
 }
 - (BOOL)hasSession { return _token != nil && _userID != nil; }
 - (void)logout { for (JFImageCache *cache in _imageCaches) [cache invalidate]; [_imageCaches release]; _imageCaches=nil; [_imageNamespace release]; _imageNamespace=nil; [_token release]; _token = nil; [_userID release]; _userID = nil; }
-- (void)dealloc { [self logout]; [_baseURL release]; [_deviceID release]; [super dealloc]; }
+- (void)dealloc { [self logout]; [_metadataCache release]; [_baseURL release]; [_deviceID release]; [super dealloc]; }
 @end

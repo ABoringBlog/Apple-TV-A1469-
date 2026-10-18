@@ -8,6 +8,7 @@
         case 22:case 23:case 24:b=JFSelect;explicitHold=YES;break;
         case 8:b=JFLeft;explicitHold=YES;break; case 9:b=JFRight;explicitHold=YES;break;
         default:return nil; }
+    if (v == 2) return @{@"button":@(b),@"phase":@"repeat"};
     if (v != 0 && v != 1) return nil;
     NSString *phase;
     if (!v) { if (_active != b) return nil; phase=@"release"; _active=0; _held=NO; }

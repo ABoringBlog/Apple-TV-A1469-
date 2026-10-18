@@ -210,13 +210,16 @@ int main(void) { @autoreleasepool {
     CHECK(Page(session)==JFLibrariesPage && [session.errorKind isEqual:@"request"]);
     CHECK([session.snapshot[@"libraries"] count]==2 && [session.snapshot[@"index"] integerValue]==0);
     CHECK([session openLibraryWithType:@"Movie"]); CHECK(![session openLibraryWithType:@"Series"]); Idle(session);
-    CHECK(Page(session)==JFMediaPage); CHECK(![session loadMore]);
+    CHECK(Page(session)==JFMediaPage);
     CHECK(![session openMediaAtIndex:20]); CHECK([session openMediaAtIndex:1]); Idle(session);
     CHECK(Page(session)==JFDetailPage && [session.snapshot[@"detail"][@"Id"] isEqual:@"movie2"]);
     CHECK([session audioTrackCount]==2); CHECK([[session audioSelectionLabel] containsString:@"Original"]);
-    CHECK([session subtitleTrackCount]==2); CHECK([[session subtitleSelectionLabel] isEqual:@"Subtitles: Off"]);
+    CHECK([session subtitleTrackCount]==1); CHECK([[session subtitleSelectionLabel] isEqual:@"Subtitles: Off"]);
     CHECK([session cycleSubtitleTrack]); CHECK([[session subtitleSelectionLabel] containsString:@"Chinese Simplified"]);
-    CHECK([session cycleSubtitleTrack]); CHECK([[session subtitleSelectionLabel] containsString:@"English PGS"]);
+    // PGS is intentionally filtered out: only local-text SRT is selectable.
+    CHECK([session subtitleTrackCount]==1);
+    CHECK([session cycleSubtitleTrack]); CHECK([[session subtitleSelectionLabel] isEqual:@"Subtitles: Off"]);
+    CHECK([session cycleSubtitleTrack]); CHECK([[session subtitleSelectionLabel] containsString:@"Chinese Simplified"]);
     CHECK([session cycleSubtitleTrack]); CHECK([[session subtitleSelectionLabel] isEqual:@"Subtitles: Off"]);
     CHECK([session cycleAudioTrack]); CHECK([[session audioSelectionLabel] containsString:@"Dub"]);
     CHECK([session goBack]); Idle(session);
@@ -303,16 +306,16 @@ int main(void) { @autoreleasepool {
     PumpUntil(^BOOL { return client.clears>clears; });
     [client release];
 
-    // Session-level pagination is single-flight and preserves media focus.
+    // Opening a library preloads all server pages and preserves media focus.
     session=NewSession(&client); [client setPagedMedia:YES];
     CHECK([session login:@"good" password:@""]); Idle(session);
     CHECK([session openLibraryWithType:@"Movie"]); Idle(session);
-    CHECK([session.snapshot[@"media"] count]==100 && [session.snapshot[@"hasMore"] boolValue]);
+    CHECK([session.snapshot[@"media"] count]==150);
     CHECK([session handleEvent:@{@"button":@(JFDown),@"phase":@"press"}]); Idle(session);
     CHECK([session.snapshot[@"mediaIndex"] integerValue]==1);
-    CHECK([session loadMore]); CHECK(![session loadMore]); Idle(session);
-    CHECK([session.snapshot[@"media"] count]==150 && ![session.snapshot[@"hasMore"] boolValue] && [session.snapshot[@"mediaIndex"] integerValue]==1);
-    CHECK(![session loadMore]);
+    CHECK([session.snapshot[@"media"] count]==150);
+    CHECK([session focusMediaAtIndex:149]); Idle(session);
+    CHECK([session.snapshot[@"mediaIndex"] integerValue]==149);
     [session close]; [session release]; [client release];
 
     // Low-priority movie poster loading follows focus and never blocks/fails browsing.

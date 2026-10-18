@@ -1,4 +1,5 @@
 #import "JFSession.h"
+#import "Playback/JFPlaybackTrace.h"
 #import "JFPosterTrace.h"
 #import "JFBrowser.h"
 #import "JFMovieMetadata.h"
@@ -16,7 +17,7 @@ NSString * const JFSessionChanged = @"JFSessionChanged";
 @end
 static NSDictionary *EmptySnapshot(void) {
     return @{@"page":@(JFLoginPage), @"libraries":@[], @"index":@(NSNotFound),
-             @"media":@[], @"mediaIndex":@(NSNotFound), @"detail":@{}, @"hasMore":@NO};
+             @"media":@[], @"mediaIndex":@(NSNotFound), @"detail":@{}};
 }
 static NSString *ErrorKind(NSError *error) {
     if (!error) return @"none";
@@ -31,6 +32,7 @@ static NSString *ErrorKind(NSError *error) {
 @interface JFSession ()
 - (id)initWithOwnedClient:(JFClient *)client;
 - (BOOL)submit:(void (^)(JFBrowser *, NSError **))action;
+- (void)queueNextLibraryChunk;
 - (BOOL)submitAuthentication:(void (^)(JFBrowser *, NSError **))action;
 - (void)interruptPosterLoad;
 - (void)clearPoster;
@@ -79,8 +81,26 @@ static NSString *ErrorKind(NSError *error) {
     [_posterItemID release]; _posterItemID=nil;
     _posterGeneration++;
 }
+- (void)setVisualArtworkMode:(BOOL)enabled {
+    if(![NSThread isMainThread] || _closed)return;
+    if(_visualArtworkMode==enabled)return;
+    _visualArtworkMode=enabled;
+    if(enabled) {
+        // The new photo grid fetches from the independent Mac artwork queue.
+        // Don't enqueue the obsolete 360px poster on the SAME serial worker
+        // as navigation/authentication. That caused multi-second Select lag.
+        [self interruptPosterLoad];
+        [_posterData release];_posterData=nil;
+        [_posterItemID release];_posterItemID=nil;
+    }
+}
 - (void)updatePosterForSnapshot {
     NSInteger page=[_snapshot[@"page"] integerValue];
+    if(_visualArtworkMode &&
+       [@[@(JFMediaPage),@(JFSeasonsPage),@(JFEpisodesPage)] containsObject:@(page)]) {
+        [self interruptPosterLoad];
+        return;
+    }
     BOOL posterPage=[@[@(JFMediaPage),@(JFSeasonsPage),@(JFEpisodesPage)] containsObject:@(page)];
     if (!posterPage) {
         JFPosterTrace([NSString stringWithFormat:@"POSTER_SKIP page=%ld",(long)page]);
@@ -196,6 +216,20 @@ static NSString *ErrorKind(NSError *error) {
     if (!item.length) return nil;
     if (![_subtitleItemID isEqual:item]) {
         [self clearSubtitleSelection]; _subtitleItemID=[item copy];
+        // Prefer a sidecar named CHS*.srt. The Jellyfin title may be localized,
+        // so match the original path basename when available as well.
+        for (NSDictionary *candidate in [self subtitleTracksForDetail]) {
+            NSString *codec=candidate[@"codec"];
+            if (![candidate[@"external"] boolValue] ||
+                ![@[@"srt",@"subrip"] containsObject:codec]) continue;
+            NSString *name=[candidate[@"path"] lastPathComponent];
+            NSString *title=candidate[@"title"];
+            if (![[name uppercaseString] hasPrefix:@"CHS"] &&
+                ![[title uppercaseString] hasPrefix:@"CHS"]) continue;
+            _subtitleSourceID=[candidate[@"sourceID"] copy];
+            _subtitleIndex=[candidate[@"index"] integerValue];
+            break;
+        }
     }
     if (_subtitleIndex<0 || !_subtitleSourceID) return nil;
     for (NSDictionary *track in [self subtitleTracksForDetail])
@@ -241,7 +275,10 @@ static NSString *ErrorKind(NSError *error) {
 }
 - (NSUInteger)subtitleTrackCount {
     if (![NSThread isMainThread] || _closed) return 0;
-    return [[self subtitleTracksForDetail] count];
+    NSUInteger count=0;
+    for (NSDictionary *track in [self subtitleTracksForDetail])
+        if ([@[@"srt",@"subrip"] containsObject:track[@"codec"]]) count++;
+    return count;
 }
 - (NSString *)subtitleSelectionLabel {
     if (![NSThread isMainThread] || _closed || [self subtitleTrackCount]==0) return nil;
@@ -252,7 +289,9 @@ static NSString *ErrorKind(NSError *error) {
 }
 - (BOOL)cycleSubtitleTrack {
     if (![NSThread isMainThread] || _closed || _busy || [_snapshot[@"page"] integerValue]!=JFDetailPage) return NO;
-    NSArray *tracks=[self subtitleTracksForDetail];
+    NSMutableArray *tracks=[NSMutableArray array];
+    for (NSDictionary *track in [self subtitleTracksForDetail])
+        if ([@[@"srt",@"subrip"] containsObject:track[@"codec"]]) [tracks addObject:track];
     if (!tracks.count) return NO;
     NSDictionary *current=[self selectedSubtitleTrackForDetail], *next=nil;
     if (!current) next=tracks[0];
@@ -269,8 +308,16 @@ static NSString *ErrorKind(NSError *error) {
     if (!item.length) return NO;
     NSString *state=_playback.currentState;
     BOOL active=[@[@"playing",@"paused"] containsObject:state ?: @""];
-    long long ticks=active ? _playback.positionTicks : [self resumeTicksForDetail];
-    if (active && ![_playback stop]) return NO;
+    // Commit to the active player before mutating the UI selection. A subtitle
+    // track from another media version must not silently switch video sources.
+    if (active) {
+        NSString *playingSource=[_playback currentMediaSourceID];
+        NSString *targetSource=next ? next[@"sourceID"] : playingSource;
+        if (!playingSource || ![targetSource isEqual:playingSource] ||
+            ![_playback selectLocalSubtitleForItem:item mediaSourceID:targetSource
+                                           index:(next ? [next[@"index"] integerValue] : -1)])
+            return NO;
+    }
     if (next) {
         [_subtitleSourceID release]; _subtitleSourceID=[next[@"sourceID"] copy]; _subtitleIndex=[next[@"index"] integerValue];
         NSArray *audio=[self audioTracksForDetail];
@@ -284,10 +331,6 @@ static NSString *ErrorKind(NSError *error) {
         [_subtitleSourceID release]; _subtitleSourceID=nil; _subtitleIndex=-1;
     }
     [self publish];
-    if (active) {
-        NSString *source=_subtitleSourceID ?: _audioSourceID;
-        return [_playback playItem:item startTicks:ticks mediaSourceID:source audioIndex:_audioIndex subtitleIndex:_subtitleIndex];
-    }
     return YES;
 }
 - (void)resetSnapshot {
@@ -295,6 +338,44 @@ static NSString *ErrorKind(NSError *error) {
     [_snapshot release]; _snapshot=[EmptySnapshot() copy];
     [_errorKind release]; _errorKind=[@"none" copy];
     [_errorDomain release]; _errorDomain=nil; _errorCode=0;
+}
+- (void)queueNextLibraryChunk {
+    if(_closed || _busy || _libraryContinuationScheduled ||
+       [_snapshot[@"page"] integerValue]!=JFMediaPage ||
+       ![_browser hasRemainingLibraryItems])return;
+    _libraryContinuationScheduled=YES;
+    NSUInteger serial=_libraryContinuationSerial,gen=_generation;
+    JFSessionDelivery *delivery=_delivery;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        JFSession *session=delivery->owner;
+        if(!session || session->_closed || session->_generation!=gen ||
+           session->_libraryContinuationSerial!=serial)return;
+        if(session->_busy || [session->_snapshot[@"page"] integerValue]!=JFMediaPage) {
+            session->_libraryContinuationScheduled=NO;return;
+        }
+        JFBrowser *browser=session->_browser;
+        [session->_worker perform:^id(NSError **error) {
+            BOOL ok=[browser appendNextLibraryChunk:error];
+            return ok?[browser snapshot]:nil;
+        } completion:^(id result,NSError *error) {
+            JFSession *owner=delivery->owner;
+            if(!owner || owner->_closed || owner->_generation!=gen ||
+               owner->_libraryContinuationSerial!=serial)return;
+            owner->_libraryContinuationScheduled=NO;
+            if(result && !owner->_busy &&
+               [owner->_snapshot[@"page"] integerValue]==JFMediaPage) {
+                NSUInteger previous=[owner->_snapshot[@"media"] count];
+                if([result[@"media"] count]>previous) {
+                    [owner->_snapshot release];owner->_snapshot=[result copy];
+                    [owner updatePosterForSnapshot];
+                    [owner publish];
+                }
+            }
+            // Never let a background page failure blank an already loaded list.
+            if(!error && !owner->_busy)[owner queueNextLibraryChunk];
+        }];
+    });
 }
 - (BOOL)submit:(void (^)(JFBrowser *, NSError **))action {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
@@ -315,6 +396,7 @@ static NSString *ErrorKind(NSError *error) {
         session->_busy=NO;
         [session updatePosterForSnapshot];
         [session publish];
+        [session queueNextLibraryChunk];
     }];
     [self publish]; return YES;
 }
@@ -360,7 +442,7 @@ static NSString *ErrorKind(NSError *error) {
 - (BOOL)refresh {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
     if ([_snapshot[@"page"] integerValue]!=JFLibrariesPage) return NO;
-    return [self submit:^(JFBrowser *browser, NSError **error) { [browser refresh:error]; }];
+    return [self submit:^(JFBrowser *browser, NSError **error) { [browser refreshUncached:error]; }];
 }
 - (BOOL)openLibraryWithType:(NSString *)type {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
@@ -368,16 +450,61 @@ static NSString *ErrorKind(NSError *error) {
     NSString *copy=[[type copy] autorelease];
     return [self submit:^(JFBrowser *browser, NSError **error) { [browser openLibraryWithType:copy error:error]; }];
 }
+- (BOOL)openLibraryAtIndex:(NSUInteger)index type:(NSString *)type {
+    if(![NSThread isMainThread] || _closed || _busy ||
+       [_snapshot[@"page"] integerValue]!=JFLibrariesPage ||
+       index>=[_snapshot[@"libraries"] count] ||
+       ![@[@"Movie",@"Series"] containsObject:type])return NO;
+    NSString *kind=[[type copy] autorelease];
+    // A separate focusLibraryAtIndex: publishes the transient index to
+    // BackRow before the media page is ready, which makes the highlight
+    // jump to a stale library (frequently Archived). Commit only inside the
+    // same serialized worker task that opens the library.
+    _libraryContinuationSerial++;
+    _libraryContinuationScheduled=NO;
+    return [self submit:^(JFBrowser *browser,NSError **error) {
+        [browser focusLibraryAtIndex:index];
+        [browser openFirstLibraryScreenWithType:kind error:error];
+    }];
+}
+- (BOOL)focusLibraryAtIndex:(NSUInteger)index {
+    if (![NSThread isMainThread] || _closed || _busy ||
+        [_snapshot[@"page"] integerValue]!=JFLibrariesPage ||
+        index>=[_snapshot[@"libraries"] count]) return NO;
+    if ([_snapshot[@"index"] unsignedIntegerValue]==index) return YES;
+    NSMutableDictionary *changed=[_snapshot mutableCopy];changed[@"index"]=@(index);
+    [_snapshot release];_snapshot=[changed copy];[changed release];
+    JFBrowser *browser=_browser;
+    // Serialize the worker's browser selection before the subsequent open request.
+    [_worker perform:^id(NSError **error) { [browser focusLibraryAtIndex:index];return nil; } completion:nil];
+    [self publish];return YES;
+}
+- (BOOL)setDetailFlag:(NSString *)flag enabled:(BOOL)enabled {
+    if (![NSThread isMainThread] || _closed || _busy ||
+        [_snapshot[@"page"] integerValue]!=JFDetailPage ||
+        ![@[@"Played",@"Favorite"] containsObject:flag]) return NO;
+    return [self submit:^(JFBrowser *browser,NSError **error) {
+        [browser setDetailFlag:flag enabled:enabled error:error];
+    }];
+}
+- (BOOL)focusMediaAtIndex:(NSUInteger)index {
+    if (![NSThread isMainThread] || _closed || _busy) return NO;
+    NSInteger page=[_snapshot[@"page"] integerValue];
+    if (![@[@(JFMediaPage),@(JFSeasonsPage),@(JFEpisodesPage)] containsObject:@(page)] ||
+        index>=[_snapshot[@"media"] count]) return NO;
+    if ([_snapshot[@"mediaIndex"] unsignedIntegerValue]==index) return YES;
+    NSMutableDictionary *changed=[_snapshot mutableCopy];
+    changed[@"mediaIndex"]=@(index);
+    [_snapshot release]; _snapshot=[changed copy]; [changed release];
+    [self updatePosterForSnapshot];
+    [self publish];
+    return YES;
+}
 - (BOOL)openMediaAtIndex:(NSUInteger)index {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
     NSInteger page=[_snapshot[@"page"] integerValue];
     if (page<JFMediaPage || page==JFDetailPage || index>=[_snapshot[@"media"] count]) return NO;
     return [self submit:^(JFBrowser *browser, NSError **error) { [browser openMediaAtIndex:index error:error]; }];
-}
-- (BOOL)loadMore {
-    if (![NSThread isMainThread] || _closed || _busy) return NO;
-    if ([_snapshot[@"page"] integerValue]!=JFMediaPage || ![_snapshot[@"hasMore"] boolValue]) return NO;
-    return [self submit:^(JFBrowser *browser, NSError **error) { [browser loadMore:error]; }];
 }
 - (BOOL)handleEvent:(NSDictionary *)event {
     if (![NSThread isMainThread] || _closed || _busy || ![event isKindOfClass:[NSDictionary class]]) return NO;
@@ -446,14 +573,23 @@ static NSString *ErrorKind(NSError *error) {
     NSDictionary *detail=_snapshot[@"detail"];
     NSString *item=[detail[@"Id"] isKindOfClass:[NSString class]] ? detail[@"Id"] : nil;
     if (!item.length) return NO;
-    long long ticks=[self resumeTicksForDetail];
+
     NSString *state=_playback.currentState;
-    if ([@[@"setup",@"playing",@"paused"] containsObject:state ?: @""] && ![_playback stop]) return NO;
+    // A true pause must resume the already-cued native player. Rebuilding PlaybackInfo/Gateway/HLS
+    // here caused a full stream restart and multi-second rebuffer on every Pause -> Resume.
+    if ([state isEqual:@"paused"]) {
+        JFPlaybackTrace(@"DETAIL_RESUME mode=native");
+        return [_playback resume];
+    }
+    if ([state isEqual:@"setup"] || [state isEqual:@"playing"]) return NO;
+
+    long long ticks=[self resumeTicksForDetail];
     [self selectedAudioTrackForDetail]; [self selectedSubtitleTrackForDetail];
     if (_subtitleSourceID && _audioSourceID && ![_subtitleSourceID isEqual:_audioSourceID]) {
         [_subtitleSourceID release]; _subtitleSourceID=nil; _subtitleIndex=-1;
     }
     NSString *source=_subtitleSourceID ?: _audioSourceID;
+    JFPlaybackTrace(@"DETAIL_RESUME mode=reopen");
     return [_playback playItem:item startTicks:ticks mediaSourceID:source audioIndex:_audioIndex subtitleIndex:_subtitleIndex];
 }
 - (BOOL)signOut {
