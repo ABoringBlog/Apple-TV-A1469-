@@ -20,7 +20,8 @@ static void Idle(JFSession *session) { PumpUntil(^BOOL { return !session.busy; }
     BOOL _started, _unblocked, _session, _reverseLibraries, _blockLibraries, _pagedMedia, _posterMedia, _posterFailure;
     NSString *_name;
     NSInteger _failure;
-    NSUInteger _clears, _remoteSignOuts, _imageRequests;
+    NSUInteger _clears, _remoteSignOuts, _imageRequests, _scanRequests, _scanTaskReads;
+    BOOL _denyScan;
 }
 - (void)unblock;
 - (BOOL)started;
@@ -33,6 +34,8 @@ static void Idle(JFSession *session) { PumpUntil(^BOOL { return !session.busy; }
 - (NSUInteger)imageRequests;
 - (NSUInteger)clears;
 - (NSUInteger)remoteSignOuts;
+- (NSUInteger)scanRequests;
+- (void)setDenyScan:(BOOL)deny;
 @end
 @implementation ScriptClient
 - (id)init {
@@ -64,6 +67,24 @@ static void Idle(JFSession *session) { PumpUntil(^BOOL { return !session.busy; }
     CHECK(![NSThread isMainThread]); _remoteSignOuts++; [self logout]; return YES;
 }
 - (BOOL)hasSession { return _session; }
+- (NSDictionary *)libraryScanTask:(NSError **)error {
+    CHECK(![NSThread isMainThread]);
+    [_gate lock];NSUInteger count=++_scanTaskReads;[_gate unlock];
+    // Simulate a real scheduled task transitioning Running -> Idle.
+    return count==1 ? @{ @"state":@"Running",@"progress":@55,
+                          @"lastStatus":@"",@"lastEnd":@"" } :
+                     @{ @"state":@"Idle",@"progress":[NSNull null],
+                        @"lastStatus":@"Completed",@"lastEnd":@"" };
+}
+- (BOOL)requestLibraryScan:(NSError **)error {
+    CHECK(![NSThread isMainThread]);
+    [_gate lock]; _scanRequests++; BOOL deny=_denyScan; [_gate unlock];
+    if (deny) {
+        if (error) *error=[NSError errorWithDomain:@"Jellyfin" code:403 userInfo:nil];
+        return NO;
+    }
+    return YES;
+}
 - (NSArray *)libraries:(NSError **)error {
     CHECK(![NSThread isMainThread]);
     [_gate lock];
@@ -170,6 +191,8 @@ static void Idle(JFSession *session) { PumpUntil(^BOOL { return !session.busy; }
 - (NSUInteger)imageRequests { [_gate lock]; NSUInteger v=_imageRequests; [_gate unlock]; return v; }
 - (NSUInteger)clears { [_gate lock]; NSUInteger v=_clears; [_gate unlock]; return v; }
 - (NSUInteger)remoteSignOuts { [_gate lock]; NSUInteger v=_remoteSignOuts; [_gate unlock]; return v; }
+- (NSUInteger)scanRequests { [_gate lock]; NSUInteger v=_scanRequests; [_gate unlock]; return v; }
+- (void)setDenyScan:(BOOL)deny { [_gate lock]; _denyScan=deny; [_gate unlock]; }
 - (void)dealloc { @synchronized([ScriptClient class]) { destroyed++; } [_gate release]; _gate=nil; [_name release]; _name=nil; [super dealloc]; }
 @end
 static JFSession *NewSession(ScriptClient **outClient) {
@@ -205,6 +228,16 @@ int main(void) { @autoreleasepool {
     [client setReverseLibraries:YES];
     CHECK([session refresh]); Idle(session);
     CHECK([session.snapshot[@"index"] integerValue]==0 && [session.snapshot[@"libraries"][0][@"Id"] isEqual:@"lib2"]);
+    CHECK([client scanRequests]==1);
+    // Poll and verify the scan state changes from Running to Completed.
+    PumpUntil(^BOOL { return [session.scanStatus containsString:@"completed"]; });
+    CHECK([session.scanStatus isEqualToString:@"Library scan completed. Open Archived."]);
+    // A forbidden Jellyfin scan must be explicit, without clearing libraries.
+    [client setDenyScan:YES];
+    CHECK([session refresh]); Idle(session);
+    CHECK([session.errorKind isEqual:@"request"] && session.errorCode==403);
+    CHECK([session.snapshot[@"libraries"] count]==2 && Page(session)==JFLibrariesPage);
+    [client setDenyScan:NO];
     // A transient refresh failure preserves the last good list and focus.
     [client failNext:500]; CHECK([session refresh]); Idle(session);
     CHECK(Page(session)==JFLibrariesPage && [session.errorKind isEqual:@"request"]);

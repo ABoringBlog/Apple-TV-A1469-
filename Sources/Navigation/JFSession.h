@@ -21,11 +21,16 @@ extern NSString * const JFSessionChanged;
     NSInteger _audioIndex, _subtitleIndex;
     NSInteger _errorCode;
     NSUInteger _generation, _posterGeneration, _libraryContinuationSerial;
+    NSString *_scanStatus;
+    NSDate *_scanRequestedAt;
+    NSUInteger _scanGeneration, _scanPollCount, _scanQueryFailures;
+    BOOL _scanAwaitAcceptance, _scanObservedRunning;
     BOOL _libraryContinuationScheduled;
     BOOL _busy, _closed, _visualArtworkMode;
 }
 - (id)initWithURL:(NSURL *)url deviceID:(NSString *)deviceID allowHTTP:(BOOL)allowHTTP;
 @property(nonatomic, readonly, copy) NSDictionary *snapshot;
+@property(nonatomic, readonly, copy) NSString *scanStatus; // Read-only live scan message; never claims success from request alone.
 @property(nonatomic, readonly, copy) NSString *errorKind; // none/authentication/timeout/transport/request
 @property(nonatomic, readonly, copy) NSString *errorDomain; // Safe diagnostic metadata only.
 @property(nonatomic, readonly) NSInteger errorCode;

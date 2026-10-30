@@ -1,6 +1,7 @@
 #import "JFV2EventSender.h"
 #import "JFPlaybackTrace.h"
 #import "JFV2ControlCodec.h"
+#import "JFV2FastHTTP.h"
 #import <dispatch/dispatch.h>
 #import <Security/Security.h>
 #import "API/JFWorker.h"
@@ -8,20 +9,19 @@
 #include <unistd.h>
 #include <math.h>
 #include <stdlib.h>
-// User-configurable Mac audio Bridge endpoint. No developer home LAN address
-// or any pairing secret is included in the public build. This plist contains
-// ONLY the address (e.g. http://192.168.1.10:8899), never a credential.
+// Public build: Mac audio endpoint is configured by the device owner.
+ // Never put pairing secrets or credentials into this address-only plist.
 static NSString *JFV2BridgeURL(void) {
     NSDictionary *prefs=[NSDictionary dictionaryWithContentsOfFile:
         @"/var/mobile/Library/Preferences/org.jellyfin.atv3.bridge.plist"];
     NSString *raw=prefs[@"AudioBridgeURL"];
-    if(![raw isKindOfClass:[NSString class]] || raw.length<10 || raw.length>180)
+    if (![raw isKindOfClass:[NSString class]] || raw.length<10 || raw.length>180)
         return @"http://127.0.0.1:8899";
-    NSURLComponents *parsed=[NSURLComponents componentsWithString:raw];
-    if(!parsed || ![@[@"http",@"https"] containsObject:parsed.scheme] ||
-       !parsed.host.length || parsed.user || parsed.password || parsed.query ||
-       parsed.fragment || parsed.path.length>1 || !parsed.port ||
-       parsed.port.integerValue<=0 || parsed.port.integerValue>65535)
+    NSURLComponents *u=[NSURLComponents componentsWithString:raw];
+    if (!u || ![[u.scheme lowercaseString] isEqualToString:@"http"] ||
+        !u.host.length || u.user || u.password || u.query || u.fragment ||
+        u.path.length>1 || !u.port || u.port.integerValue<1 ||
+        u.port.integerValue>65535)
         return @"http://127.0.0.1:8899";
     return [raw hasSuffix:@"/"]?[raw substringToIndex:raw.length-1]:raw;
 }
@@ -34,13 +34,36 @@ static NSString *JFV2BridgeURL(void) {
 + (NSDictionary *)request:(NSURLRequest *)request {
     JFV2BoundedHTTP *d=[[[self alloc] init] autorelease];d->_data=[NSMutableData new];
     NSURLConnection *connection=[[[NSURLConnection alloc] initWithRequest:request delegate:d startImmediately:YES] autorelease];
-    NSTimeInterval deadline=[NSProcessInfo processInfo].systemUptime+1.5;
+    // The caller chooses the deadline: hello can tolerate Wi-Fi jitter,
+    // authenticated start/prepare can take up to 4 seconds for verified-cache
+    // checks. All post-start controls retain the existing 1.5-second cap.
+    NSTimeInterval allowed=MIN(4.0,MAX(0.1,request.timeoutInterval));
+    NSTimeInterval begin=[NSProcessInfo processInfo].systemUptime;
+    NSTimeInterval deadline=begin+allowed;
     while (!d->_done && [NSProcessInfo processInfo].systemUptime<deadline)
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+    NSTimeInterval duration=([NSProcessInfo processInfo].systemUptime-begin);
+    BOOL timedOut=!d->_done;
     [connection cancel];
-    if (!d->_done || d->_failed || d->_status!=200) return nil;
+    if (timedOut || d->_failed || d->_status!=200) {
+        // No URLs, auth headers, payloads, item IDs, credentials or pairing
+        // material in diagnostics. Server HTTP 403 is NOT a timeout.
+        NSString *reason=timedOut?@"timeout":d->_failed?@"transport":@"http-rejected";
+        JFPlaybackTrace([NSString stringWithFormat:
+            @"V2_HTTP_FAILURE route=%@ reason=%@ status=%ld ms=%ld",
+            [request.URL.path isEqual:@"/v2/hello"]?@"hello":@"control",
+            reason,(long)d->_status,(long)(duration*1000)]);
+        return nil;
+    }
     id result=[NSJSONSerialization JSONObjectWithData:d->_data options:0 error:NULL];
-    return [result isKindOfClass:[NSDictionary class]]?result:nil;
+    if(![result isKindOfClass:[NSDictionary class]]) {
+        JFPlaybackTrace([NSString stringWithFormat:
+           @"V2_HTTP_FAILURE route=%@ reason=bad-json status=%ld ms=%ld",
+           [request.URL.path isEqual:@"/v2/hello"]?@"hello":@"control",
+           (long)d->_status,(long)(duration*1000)]);
+        return nil;
+    }
+    return result;
 }
 - (NSURLRequest *)connection:(NSURLConnection *)c willSendRequest:(NSURLRequest *)r redirectResponse:(NSURLResponse *)response {
     if (response) {_failed=YES;_done=YES;return nil;}return r;
@@ -66,7 +89,9 @@ static BOOL HexID(id s) {
 @interface JFV2EventSender () {
     NSData *_key; dispatch_queue_t _queue; dispatch_semaphore_t _pending;
     NSString *_session,*_epoch; long long _sequence,_serverMS; NSTimeInterval _helloMono;
-    BOOL _invalid; BOOL _syncPending; void (^_termination)(BOOL); void (^_started)(void); void (^_committed)(void); BOOL _confirmedStopped; BOOL _startPrepared;
+    BOOL _invalid; BOOL _syncPending;
+    BOOL _startRequestInFlight, _startRequestIssued, _signedCacheMiss;
+    void (^_termination)(BOOL); void (^_started)(void); void (^_committed)(void); BOOL _confirmedStopped; BOOL _startPrepared;
     long long _clockOffsetUS, _clockUncertaintyUS; BOOL _clockReady; NSUInteger _clockProbeCount;
 }
 @end
@@ -82,9 +107,9 @@ static BOOL HexID(id s) {
 - (BOOL)hello {
     NSString *nonce=RandomID();if (!nonce)return NO;
     NSURL *url=[NSURL URLWithString:[[JFV2BridgeURL() stringByAppendingString:@"/v2/hello?nonce="] stringByAppendingString:nonce]];
-    NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:1.5];
+    NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:2.5];
     NSTimeInterval t0=[NSProcessInfo processInfo].systemUptime;
-    NSDictionary *reply=[JFV2BoundedHTTP request:r];
+    NSDictionary *reply=[JFV2FastHTTP request:r];
     NSTimeInterval t2=[NSProcessInfo processInfo].systemUptime;
     JFPlaybackTrace(reply ? @"V2_HELLO_HTTP_200_JSON" : @"V2_HELLO_HTTP_OR_JSON_FAILED");
     NSString *epoch=reply[@"epoch"];
@@ -140,6 +165,23 @@ static BOOL HexID(id s) {
         JFPlaybackTrace(@"V2_CONTROL_QUEUE_FULL_INVALIDATE");
         [self invalidate];return;
     }
+    if ([kind isEqual:@"start"]) {
+        BOOL suppressed=NO;
+        @synchronized(self) {
+            suppressed=(_invalid || _startRequestInFlight || _startPrepared ||
+                       (_startRequestIssued && !_signedCacheMiss));
+            if(!suppressed) {
+                _startRequestInFlight=YES;
+                _startRequestIssued=YES;
+                _signedCacheMiss=NO; // requires a fresh *signed* miss again
+            }
+        }
+        if(suppressed) {
+            JFPlaybackTrace(@"V2_DUPLICATE_START_SUPPRESSED");
+            dispatch_semaphore_signal(_pending);
+            return;
+        }
+    }
     // Snapshot time immediately after the current main-thread LTAVPlayer read.
     NSTimeInterval created=[NSProcessInfo processInfo].systemUptime;
     long long sampleUS=llround(created*1000000.0);
@@ -147,6 +189,7 @@ static BOOL HexID(id s) {
     dispatch_async(_queue,^{ @autoreleasepool {
         BOOL valid=NO;@synchronized(self){valid=!_invalid;}
         BOOL recoverableSyncTransportFailure=NO;
+        BOOL acceptedCacheMiss=NO;
         // Preserve the established <1-second freshness gate, but distinguish
         // a disposable periodic sync from a command whose delivery matters.
         // A stale sync has NOT been assigned a sequence number, and must
@@ -194,18 +237,26 @@ static BOOL HexID(id s) {
                 NSString *nonce=RandomID();
                 long long stamp=_serverMS+(long long)(([NSProcessInfo processInfo].systemUptime-_helloMono)*1000);
                 NSData *body=JFV2Envelope(_key,_epoch,event,stamp,nonce);
-                NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[JFV2BridgeURL() stringByAppendingString:@"/v2/control"]] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:1.5];
+                // Mac permits up to 4.5 seconds of signed start skew. Allow
+                // that one preparation request 4.0 seconds; never relax the
+                // pause/seek/stop/sync deadlines or signature validation.
+                NSTimeInterval transportTimeout=[command isEqual:@"start"]?4.0:1.5;
+                NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[JFV2BridgeURL() stringByAppendingString:@"/v2/control"]] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:transportTimeout];
                 r.HTTPMethod=@"POST";r.HTTPBody=body;[r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
                 @synchronized(self){if (_invalid)body=nil;}
                 NSTimeInterval commandSent=[NSProcessInfo processInfo].systemUptime;
-                NSDictionary *reply=body?[JFV2BoundedHTTP request:r]:nil;
+                NSDictionary *reply=body?(isSync?[JFV2FastHTTP request:r]:[JFV2BoundedHTTP request:r]):nil;
                 // No answer to a periodic sync is not an authenticated
                 // rejection. The Mac's native 5-second watchdog independently
                 // stops orphaned sound; a later signed heartbeat can recover.
                 recoverableSyncTransportFailure=([command isEqual:@"sync"] &&
                     body && reply==nil);
                 NSTimeInterval commandReceived=[NSProcessInfo processInfo].systemUptime;
-                if ([command isEqual:@"start"]) JFPlaybackTrace(reply ? @"V2_START_HTTP_200_JSON" : @"V2_START_HTTP_OR_JSON_FAILED");
+                if ([command isEqual:@"start"]) {
+                    JFPlaybackTrace([NSString stringWithFormat:
+                        @"V2_START_HTTP_DURATION ms=%ld",(long)((commandReceived-commandSent)*1000)]);
+                    JFPlaybackTrace(reply ? @"V2_START_HTTP_200_JSON" : @"V2_START_HTTP_OR_JSON_FAILED");
+                }
                 NSString *expected=@{@"start":@"prepare",@"commit":@"commit",@"pause":@"pause",@"resume":@"resume",@"seek":@"seek",@"sync":@"observe",@"stop":@"stop"}[command];
                 BOOL signatureOK=JFV2Receipt(_key,reply,_epoch,nonce);
                 if ([command isEqual:@"start"]) {
@@ -223,7 +274,12 @@ static BOOL HexID(id s) {
                 }
                 BOOL cachePending=[command isEqual:@"start"] && signatureOK &&
                     [reply[@"ok"] boolValue] && [reply[@"kind"] isEqual:@"cache-miss"];
-                valid=(signatureOK && [reply[@"ok"] boolValue] && [reply[@"kind"] isEqual:expected]) || cachePending;
+                acceptedCacheMiss=cachePending;
+                BOOL staleSyncAccepted=([command isEqual:@"sync"] && signatureOK &&
+                    [reply[@"ok"] boolValue] && [reply[@"kind"] isEqual:@"stale-sync"]);
+                valid=(signatureOK && [reply[@"ok"] boolValue] && [reply[@"kind"] isEqual:expected]) ||
+                    cachePending || staleSyncAccepted;
+                if (staleSyncAccepted) JFPlaybackTrace(@"V2_STALE_SYNC_DROPPED_NONFATAL");
                 if ([command isEqual:@"start"] && valid && !cachePending) {
                     @synchronized(self) {_startPrepared=YES;}
                 }
@@ -304,12 +360,24 @@ static BOOL HexID(id s) {
                 [self invalidate];
             }
         } // No retries, and no autonomous restart after an actual rejection.
+        if ([command isEqual:@"start"]) @synchronized(self) {
+            _startRequestInFlight=NO;
+            // Only a verified cache-miss allows reattempt. A success is
+            // handled by the existing signed Prepare -> Commit callback.
+            _signedCacheMiss=acceptedCacheMiss && valid && !_invalid;
+        }
         if ([command isEqual:@"sync"]) @synchronized(self){_syncPending=NO;}
         [metadata release];[command release];dispatch_semaphore_signal(_pending);
     }});
 }
 - (BOOL)preparedAccepted {
     @synchronized(self) {return _startPrepared;}
+}
+- (BOOL)cacheMissRetryAllowed {
+    @synchronized(self) {
+        return !_invalid && !_startPrepared && !_startRequestInFlight &&
+               _startRequestIssued && _signedCacheMiss;
+    }
 }
 - (void)invalidate {
     @synchronized(self){if (_invalid)return;_invalid=YES;}
@@ -388,7 +456,11 @@ BOOL JFV2WaitForAudioCache(NSString *item, NSString *source, NSInteger track) {
             long long timestamp=serverMS+(long long)(([NSProcessInfo processInfo].systemUptime-helloMono)*1000.0);
             NSData *body=JFV2Envelope(key,epoch,event,timestamp,nonce);
             if (!body) return NO;
-            NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[JFV2BridgeURL() stringByAppendingString:@"/v2/control"]] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:1.5];
+            // Signed warm request may require full SHA-256 of a verified 150-270MB
+            // local audio file (~0.7-1.4s). Allow bounded Wi-Fi/scheduler
+            // margin without bypassing the fail-closed cache/audio gate.
+            // Do not change live playback/control command timeouts.
+            NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:[JFV2BridgeURL() stringByAppendingString:@"/v2/control"]] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:4.0];
             r.HTTPMethod=@"POST";r.HTTPBody=body;
             [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
             NSDictionary *reply=[JFV2BoundedHTTP request:r];

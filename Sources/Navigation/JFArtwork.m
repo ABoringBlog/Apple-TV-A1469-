@@ -2,6 +2,7 @@
 #import "API/JFClient.h"
 #import "API/JFWorker.h"
 #import "API/JFImageCache.h"
+#import "JFPosterTrace.h"
 #import <ImageIO/ImageIO.h>
 NSString * const JFArtworkChanged=@"JFArtworkChanged";
 // Decode JPEG/PNG on the artwork worker, not on ATV3's main UI thread.
@@ -53,8 +54,68 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
         _fastDisk=[[JFImageCache alloc] initWithDirectory:dir2 ttl:7*24*3600];
 #endif
         _images=[NSMutableDictionary new]; _order=[NSMutableArray new]; _pending=[NSMutableSet new];
+        // Fetch immediately and poll Jellyfin's avatar ImageTag every 2 min.
+        // All network and decode work stays on a separate worker queue.
+        [self refreshAvatarIfNeeded];
+        [self scheduleAvatarPoll];
     }
     return self;
+}
+- (void)scheduleAvatarPoll {
+    if(_closed)return;
+    JFArtwork *owner=[self retain];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,120*NSEC_PER_SEC),
+                   dispatch_get_main_queue(),^{
+        if(!owner->_closed) {
+            [owner refreshAvatarIfNeeded];
+            [owner scheduleAvatarPoll];
+        }
+        [owner release];
+    });
+}
+- (void)refreshAvatarIfNeeded {
+    if(_closed || _avatarPollPending || ![NSThread isMainThread])return;
+    _avatarPollPending=YES;
+    NSUInteger serial=_generation;
+    JFClient *client=_fastClient;
+    NSString *token=_credential;
+    NSString *existingTag=[_avatarTag copy];
+    [_fastWorker perform:^id(NSError **error) {
+        if(!_fastAuthorized) {
+            if(![client authenticateToken:token error:error])return nil;
+            _fastAuthorized=YES;
+        }
+        NSDictionary *user=[client currentUser:error];
+        if(!user)return nil;
+        NSString *tag=[user[@"PrimaryImageTag"] isKindOfClass:[NSString class]]?
+                      user[@"PrimaryImageTag"]:nil;
+        if(!tag)tag=[user[@"ImageTags"] isKindOfClass:[NSDictionary class]]?
+                         user[@"ImageTags"][@"Primary"]:nil;
+        if(!tag)tag=@"";
+        if([existingTag isEqualToString:tag])return @{@"tag":tag,@"unchanged":@YES};
+        if(!tag.length)return @{@"tag":tag,@"empty":@YES};
+        NSData *bytes=[client freshCurrentAvatarWithTag:tag width:180 error:error];
+        if(!bytes)return nil;
+        JFDecodedBitmap *decoded=[[[JFDecodedBitmap alloc] initWithBytes:bytes] autorelease];
+        if(!decoded)return nil;
+        return @{@"tag":tag,@"avatar":decoded};
+    } completion:^(id value,NSError *error) {
+        if(_closed || _generation!=serial)return;
+        _avatarPollPending=NO;
+        if(![value isKindOfClass:[NSDictionary class]])return;
+        NSString *tag=value[@"tag"];
+        if(![tag isKindOfClass:[NSString class]] || [_avatarTag isEqualToString:tag])return;
+        JFDecodedBitmap *avatar=[value[@"avatar"] isKindOfClass:[JFDecodedBitmap class]]?
+                                 value[@"avatar"]:nil;
+        if(!avatar && ![value[@"empty"] boolValue])return; // retry next poll
+        [_avatarTag release];_avatarTag=[tag copy];
+        NSString *key=@"me/Avatar/180";
+        if(avatar)_images[key]=avatar;else [_images removeObjectForKey:key];
+        _artworkVersion++;
+        JFPosterTrace(@"JELLYFIN_AVATAR_VERSION_CHANGED");
+        [[NSNotificationCenter defaultCenter] postNotificationName:JFArtworkChanged object:self];
+    }];
+    [existingTag release];
 }
 - (NSData *)imageBytesForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width {
     if(_closed || ![NSThread isMainThread])return nil;
@@ -66,6 +127,10 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
     return nil;
 }
 - (CGImageRef)copyImageForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width {
+    if([type isEqualToString:@"Avatar"] && [identifier isEqualToString:@"me"]) {
+        JFDecodedBitmap *avatar=_images[@"me/Avatar/180"];
+        return avatar?CGImageRetain(avatar->pixels):NULL;
+    }
     if (_closed || ![NSThread isMainThread] || !identifier.length || identifier.length>128 ||
         ![@[@"Primary",@"Thumb",@"Backdrop",@"Logo",@"Avatar"] containsObject:type] ||
         width<24 || width>2048) return NULL;
@@ -99,9 +164,19 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
         if ([payload isKindOfClass:[JFDecodedBitmap class]]) {
             _images[key]=payload;
             [_order addObject:key];
-            while (_images.count>28 && _order.count) {
+            // Keep 1 GiB of compressed images on disk, but bound decoded
+            // pixel buffers independently. AppleTV3,2 has only 512 MiB RAM.
+            NSUInteger decodedBytes=0;
+            for(JFDecodedBitmap *entry in [_images allValues])
+                if([entry isKindOfClass:[JFDecodedBitmap class]] && entry->pixels)
+                    decodedBytes+=CGImageGetBytesPerRow(entry->pixels)*CGImageGetHeight(entry->pixels);
+            while((_images.count>28 || decodedBytes>96UL*1024*1024) && _order.count) {
                 NSString *old=[[_order objectAtIndex:0] retain];
-                [_order removeObjectAtIndex:0];[_images removeObjectForKey:old];
+                [_order removeObjectAtIndex:0];
+                JFDecodedBitmap *evicted=_images[old];
+                if([evicted isKindOfClass:[JFDecodedBitmap class]] && evicted->pixels)
+                    decodedBytes-=MIN(decodedBytes,CGImageGetBytesPerRow(evicted->pixels)*CGImageGetHeight(evicted->pixels));
+                [_images removeObjectForKey:old];
                 [old release];
             }
             _artworkVersion++;
@@ -127,6 +202,36 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
         // UI reads recent local listings instantly. This isolated low-priority
         // prefetch client updates the catalog from Jellyfin in the background.
         client.catalogNetworkOnly=YES;
+        // Warm the exact lightweight 11-item request used by the interactive
+        // browser before starting its much larger 101-item image scan.
+        // This runs on the dedicated prefetch worker, never the UI thread.
+        // Prioritize actual movie collections over archive/mixed collections.
+        NSArray *ordered=[views sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a,NSDictionary *b) {
+            NSString *ac=[a[@"CollectionType"] lowercaseString];
+            NSString *bc=[b[@"CollectionType"] lowercaseString];
+            NSInteger ap=[ac isEqual:@"movies"]?0:[ac isEqual:@"tvshows"]?1:2;
+            NSInteger bp=[bc isEqual:@"movies"]?0:[bc isEqual:@"tvshows"]?1:2;
+            return ap==bp?NSOrderedSame:(ap<bp?NSOrderedAscending:NSOrderedDescending);
+        }];
+        for(NSDictionary *view in ordered) {
+            if(JFWorkCancelled())break;
+            NSString *libID=view[@"Id"];
+            if(![libID isKindOfClass:[NSString class]] || !libID.length)continue;
+            NSString *collection=[view[@"CollectionType"] lowercaseString];
+            NSArray *types=[collection isEqual:@"movies"]?@[@"Movie"]:
+                           [collection isEqual:@"tvshows"]?@[@"Series"]:@[@"Movie",@"Series"];
+            for(NSString *kind in types) {
+                if(JFWorkCancelled())break;
+                NSTimeInterval start=[NSProcessInfo processInfo].systemUptime;
+                NSArray *first=[client itemsInLibrary:libID type:kind start:0 limit:11 error:NULL];
+                JFPosterTrace([NSString stringWithFormat:
+                    @"PREFETCH_INTERACTIVE_FIRST11_READY count=%lu elapsed_ms=%lld success=%d",
+                    (unsigned long)first.count,
+                    (long long)(([NSProcessInfo processInfo].systemUptime-start)*1000.0),
+                    first!=nil]);
+            }
+        }
+        // Only heavy metadata/artwork scanning is deliberately delayed.
         [NSThread sleepForTimeInterval:1.7];
         // Tier-order is global, not per-library: download EVERY cover before
         // spending any ATV storage or worker time on Backdrop/Logo/metadata.
@@ -148,10 +253,20 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
             NSDictionary *tags=[item[@"ImageTags"] isKindOfClass:[NSDictionary class]]?item[@"ImageTags"]:@{};
             for(NSString *kind in @[@"Primary",@"Thumb"])
                 if(tags[kind])add(ident,kind,400,0);
-            if(tags[@"Logo"])add(ident,@"Logo",630,archived?2:1);
+            // Preserve all normal covers first, then store the higher-res
+            // detail poster without evicting any same-tier essential cover.
+            NSString *category=item[@"Type"];
+            BOOL feature=([category isEqual:@"Movie"] || [category isEqual:@"Series"]);
+            if(feature && tags[@"Primary"])add(ident,@"Primary",800,0);
+            if(tags[@"Logo"]) {
+                add(ident,@"Logo",630,archived?2:1);
+                if(feature)add(ident,@"Logo",900,archived?2:1);
+            }
             if([item[@"BackdropImageTags"] isKindOfClass:[NSArray class]] &&
-               [item[@"BackdropImageTags"] count])
+               [item[@"BackdropImageTags"] count]) {
                 add(ident,@"Backdrop",1280,archived?2:1);
+                if(feature)add(ident,@"Backdrop",1920,archived?2:1);
+            }
         };
         for(NSDictionary *view in views) {
             if(JFWorkCancelled())break;
@@ -160,6 +275,12 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
             BOOL archived=[view[@"Name"] isKindOfClass:[NSString class]] &&
                 [[view[@"Name"] lowercaseString] isEqualToString:@"archived"];
             collect(view,archived);
+            // Native 1080p Libraries cards are ~760 physical pixels wide.
+            NSDictionary *viewTags=view[@"ImageTags"];
+            if([viewTags isKindOfClass:[NSDictionary class]]) {
+                if(viewTags[@"Primary"])add(libID,@"Primary",900,0);
+                else if(viewTags[@"Thumb"])add(libID,@"Thumb",900,0);
+            }
             NSString *collection=[view[@"CollectionType"] lowercaseString];
             NSArray *types=[collection isEqual:@"movies"]?@[@"Movie"]:
                            [collection isEqual:@"tvshows"]?@[@"Series"]:@[@"Movie",@"Series"];
@@ -217,6 +338,6 @@ NSString * const JFArtworkChanged=@"JFArtworkChanged";
 }
 - (void)dealloc {
     [self close]; [_client release]; [_worker release];[_fastClient release];[_fastWorker release];[_fastDisk release];[_prefetchClient release];[_prefetchWorker release];[_disk release]; [_credential release];
-    [_images release]; [_pending release]; [_order release]; [super dealloc];
+    [_avatarTag release];[_images release]; [_pending release]; [_order release]; [super dealloc];
 }
 @end

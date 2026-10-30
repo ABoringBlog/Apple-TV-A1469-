@@ -22,6 +22,8 @@ extern NSString * const JFArtworkChanged;
     NSMutableSet *_pending;
     NSMutableArray *_order;
     BOOL _authorized, _closed, _prefetchStarted;
+    NSString *_avatarTag;
+    BOOL _avatarPollPending;
     NSUInteger _generation, _artworkVersion;
 }
 - (id)initWithURL:(NSURL *)url deviceID:(NSString *)deviceID token:(NSString *)token;
@@ -30,5 +32,6 @@ extern NSString * const JFArtworkChanged;
 - (NSData *)imageBytesForID:(NSString *)identifier type:(NSString *)type width:(NSUInteger)width;
 - (void)prefetchLibraries:(NSArray *)libraries;
 - (void)setActiveLibraryArchived:(BOOL)archived;
+- (void)refreshAvatarIfNeeded;
 - (void)close;
 @end

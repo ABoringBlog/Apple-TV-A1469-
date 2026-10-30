@@ -14,6 +14,7 @@
     NSTimeInterval _ignoreNativeRateUntil, _startRequestedAt, _resumeRequestedAt, _seekRequestedAt, _zeroPositionSince;
     BOOL _presented, _started, _stopping, _nativePaused, _zeroPositionActive;
     BOOL _verifiedNativePresentation;
+    NSTimeInterval _nativeExitSuspectSince; // Monotonic; first transient presentation mismatch.
     BOOL _startProgressPending, _resumeProgressPending, _seekProgressPending;
 }
 + (BOOL)runtimeCompatible;

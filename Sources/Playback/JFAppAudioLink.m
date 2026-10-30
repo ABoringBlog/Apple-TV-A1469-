@@ -119,7 +119,11 @@ JFV2MainThreadFence *safetyFence;dispatch_source_t safetyTimer;
         if (now-startSentAt>(startupPending?20.0:240.0)) {
             JFPlaybackTrace(@"V2_PREPARE_PENDING_TIMEOUT");
             ending=YES;[sender invalidate];[timer invalidate];
-        } else if (now-lastCacheRetry>=1.8) {
+        } else if (now-lastCacheRetry>=1.8 && [sender cacheMissRetryAllowed]) {
+            // Never enqueue another Start while the original signed Start is
+            // pending: a 1.8s timer previously raced with a 1.81s receipt,
+            // caused a duplicate Start and invalidated the subsequent Commit.
+            JFPlaybackTrace(@"V2_CACHE_MISS_SIGNED_RETRY");
             long long position=0;double rate=0;
             if (JFV2VideoSnapshot(localPlayer,[plan[@"durationTicks"] longLongValue],
                                   &position,&rate) && position>=0) ticks=position;

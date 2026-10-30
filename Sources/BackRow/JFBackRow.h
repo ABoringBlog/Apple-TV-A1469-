@@ -6,3 +6,4 @@ id JFBRObject(id target, NSString *selector);
 id JFBRObjectWithObject(id target, NSString *selector, id argument);
 
 void JFBRClearRemoteState(id controller);
+void JFBRResetRemoteForPageChange(id controller);

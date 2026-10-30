@@ -8,6 +8,8 @@
 - (id)initWithKey:(NSData *)key;
 - (void)event:(NSString *)kind plan:(NSDictionary *)plan ticks:(long long)ticks;
 - (BOOL)preparedAccepted; // Verified Mac prepare receipt seen for this session.
+// Re-issue Start only after a signed cache-miss response; never while pending.
+- (BOOL)cacheMissRetryAllowed;
 - (void)invalidate;
 @end
 

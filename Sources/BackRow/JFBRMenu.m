@@ -65,7 +65,7 @@ BOOL JFBRMenuClassAvailable(Class cls) {
 }
 @implementation JFBRMenu
 - (id)initWithController:(id)controller {
-    if ((self=[super init])) { _controller=controller; _rows=[@[@{@"title":@"Jellyfin",@"enabled":@NO}] copy]; _title=[@"Jellyfin" copy]; }
+    if ((self=[super init])) { _controller=controller; _rows=[@[@{@"title":@"Jellyfin",@"enabled":@NO}] copy]; _title=[@"Jellyfin" copy]; _needsReload=YES; }
     return self;
 }
 - (BOOL)canRender {
@@ -87,20 +87,30 @@ BOOL JFBRMenuClassAvailable(Class cls) {
 - (BOOL)render {
     if (!_active || ![self canRender]) { return NO; }
     id list=JFBRObject(_controller,@"list");
-    BOOL titleOK=JFBRCall(_controller,@"setListTitle:",@[_title]);
-    BOOL sourceOK=JFBRCall(list,@"setDatasource:",@[self]);
-    BOOL reloadOK=JFBRCall(list,@"reload",@[]);
+    // On 12H1006 an unconditional BRList.reload can rebuild 200+ items.
+    // This must happen on a data change, NOT on a focus-only/poster refresh.
+    // Still validate the native ABI and update the selection every time.
+    BOOL titleOK=YES,sourceOK=YES,reloadOK=YES;
+    if(_needsReload) {
+        titleOK=JFBRCall(_controller,@"setListTitle:",@[_title]);
+        sourceOK=JFBRCall(list,@"setDatasource:",@[self]);
+        reloadOK=JFBRCall(list,@"reload",@[]);
+    }
     BOOL selectionOK=JFBRSetInteger(list,@"setSelection:",_selection);
-    return titleOK && sourceOK && reloadOK && selectionOK;
+    BOOL success=titleOK && sourceOK && reloadOK && selectionOK;
+    if(success)_needsReload=NO;
+    return success;
 }
 - (BOOL)activate {
     if (![NSThread isMainThread] || _closed) return NO;
     _active=YES;
+    _needsReload=YES; // Datasource may have been cleared at deactivation.
     if (![self render]) { [self deactivate]; return NO; }
     return YES;
 }
 - (void)deactivate {
     _active=NO;
+    _needsReload=YES;
     JFBRCall(JFBRObject(_controller,@"list"),@"setDatasource:",@[[NSNull null]]);
 }
 - (void)close {
@@ -110,6 +120,11 @@ BOOL JFBRMenuClassAvailable(Class cls) {
 }
 - (void)displayTitle:(NSString *)title rows:(NSArray *)rows selection:(long)selection {
     if (_closed) return;
+    // Matching visible rows do not require a native BackRow reload. Compare
+    // actual dictionaries rather than just row count to avoid stale titles
+    // after metadata/pagination changes.
+    if(![_title isEqualToString:title] || ![_rows isEqualToArray:rows])
+        _needsReload=YES;
     [_title release]; _title=[title copy]; [_rows release]; _rows=[rows copy];
     _selection=rows.count ? MAX(0,MIN(selection,(long)rows.count-1)) : 0;
     if (_active && ![self render]) [self deactivate];

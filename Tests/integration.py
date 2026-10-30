@@ -11,7 +11,7 @@ import sys
 from urllib.parse import urlsplit
 
 STAGES = ('configuration', 'public server information', 'authentication',
-          'authenticated libraries', 'first media page', 'second media page',
+          'authenticated libraries', 'authenticated read-only library scan status', 'first media page', 'second media page',
           'media detail', 'poster download', 'backdrop download', 'local session cleared',
           'server logout and token invalidation', 'TLS rejects invalid certificate', 'offline transport', 'connection total deadline')
 SKIPS = {'SKIP: media pagination (library ID not configured)',

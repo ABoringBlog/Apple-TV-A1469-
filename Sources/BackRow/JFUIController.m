@@ -284,11 +284,16 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     if (_artwork) {
         [[NSNotificationCenter defaultCenter] addObserver:self
             selector:@selector(artworkChanged:) name:JFArtworkChanged object:_artwork];
-        [_artwork prefetchLibraries:_session.snapshot[@"libraries"]];
+        // ATV3's TouchRemote network events contend with the aggressive
+        // per-library background 101-item + cover scan on the A5 device.
+        // Keep the existing persistent artwork cache and on-demand poster
+        // loaders, but do NOT start the speculative whole-library crawler.
+        JFPosterTrace(@"ARTWORK_EAGER_PREFETCH_DISABLED");
     }
 }
 - (void)displayVisual {
     if (!_active || _closed || _editor) return;
+    NSTimeInterval visualStart=[NSProcessInfo processInfo].systemUptime;
     if (_page==JFDetailPage && [_session.playback.currentState isEqual:@"playing"])
         return; // The native fullscreen player, not our grid, owns the display.
     [self ensureArtwork];
@@ -297,14 +302,27 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     NSDictionary *current=[libraries isKindOfClass:[NSArray class]] && index<libraries.count?libraries[index]:nil;
     [_artwork setActiveLibraryArchived:[current[@"Name"] isKindOfClass:[NSString class]] &&
         [[current[@"Name"] lowercaseString] isEqualToString:@"archived"]];
-    [_artwork prefetchLibraries:libraries];
+    // No speculative full-library scan on every visual pass; on-demand art
+    // still loads through copyImageForID: and existing disk cache.
     [_visual renderSnapshot:_session.snapshot rows:_rows selection:_selection
                    artwork:_artwork poster:_session.posterData username:_username
                     search:_searchActive query:_searchQuery scroll:_detailScroll];
+    NSTimeInterval visualDuration=[NSProcessInfo processInfo].systemUptime-visualStart;
+    if(visualDuration>0.075)
+        JFPosterTrace([NSString stringWithFormat:
+            @"PERF_VISUAL_SLOW page=%ld duration_ms=%lld rows=%lu",
+            (long)_page,(long long)(visualDuration*1000.0),(unsigned long)_rows.count]);
 }
 - (void)sessionChanged:(NSNotification *)notification {
     if (_closed || notification.object!=_session) return;
     [self setMessage:@""]; [self syncSessionCredential];
+    if (_pendingLibraryRefresh && !_session.busy) {
+        _pendingLibraryRefresh=NO;
+        if ([_session.errorKind isEqual:@"none"])
+            JFPosterTrace(@"LIBRARY_SCAN_REQUEST_ACCEPTED");
+        else JFPosterTrace([NSString stringWithFormat:@"LIBRARY_SCAN_REQUEST_FAILED code=%ld",
+                                  (long)_session.errorCode]);
+    }
     NSString *state=_session.playback.currentState;
     // Backend progress is published every second even when the user is in
     // full-screen playback. Do not encode a hidden 720p JPEG for each tick.
@@ -313,15 +331,28 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     if (_playbackBackend && !_session.busy && !_session.playback)
         (void)[_session configurePlaybackBackend:_playbackBackend];
     [self refreshView];
-    BOOL updated=JFBRCall(_controller,@"updatePreviewController",@[]);
-    JFPosterTrace([NSString stringWithFormat:@"UI_UPDATE_PREVIEW invoked=%d",updated]);
+    // BackRow preview requests while the image is absent/mismatched only
+    // trigger repeated expensive controller refreshes. The native grid already
+    // draws its focus; refresh the legacy preview once the matching image exists.
+    BOOL ready=YES;
+    if(_page==JFMediaPage) {
+        NSString *itemID=nil;
+        if(_selection>=0 && (NSUInteger)_selection<_rows.count)
+            itemID=_rows[(NSUInteger)_selection][@"itemID"];
+        ready=(_session.posterData.length>0 && itemID.length &&
+               [itemID isEqual:_session.posterItemID]);
+    }
+    BOOL updated=ready?JFBRCall(_controller,@"updatePreviewController",@[]):NO;
+    if(!ready) JFPosterTrace(@"UI_PREVIEW_SKIPPED_UNREADY");
+    else JFPosterTrace([NSString stringWithFormat:@"UI_UPDATE_PREVIEW invoked=%d",updated]);
 }
 - (void)refreshView {
     if (_closed) return;
+    NSTimeInterval refreshStart=[NSProcessInfo processInfo].systemUptime;
     NSDictionary *snapshot=_session.snapshot;
     NSInteger page=snapshot ? [snapshot[@"page"] integerValue] : JFLoginPage;
     if (page!=_page) {
-        JFBRClearRemoteState(_controller);
+        JFBRResetRemoteForPageChange(_controller);
         _selection=page==JFLibrariesPage?MAX(0,[snapshot[@"index"] integerValue]):0;
         _page=page;
         [_lastPresentedPlayerState release];_lastPresentedPlayerState=nil;
@@ -439,11 +470,14 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
                 if([rows[i][@"action"] isEqual:oldAction]){_selection=(NSInteger)i;break;}
     }
     NSString *error=_session.errorKind;
-    NSString *message=_message;
+    NSString *message=page==JFLibrariesPage && _session.scanStatus.length ?
+                     _session.scanStatus : _message;
     if ([error isEqual:@"authentication"]) message=_session.errorCode ? [NSString stringWithFormat:@"Sign in again — authentication failed (%ld)",(long)_session.errorCode] : @"Sign in again — session expired or credentials rejected";
     else if ([error isEqual:@"timeout"]) message=@"Request timed out — try again";
     else if ([error isEqual:@"tls"]) message=@"Secure connection failed — check the server certificate and Apple TV date";
     else if ([error isEqual:@"transport"]) message=@"Cannot reach the server — check its address and your network";
+    else if ([error isEqual:@"request"] && page==JFLibrariesPage && _session.errorCode==403)
+        message=@"Library scan denied — Jellyfin administrator required";
     else if ([error isEqual:@"request"]) message=_session.errorCode ? [NSString stringWithFormat:@"Request failed (%ld)",(long)_session.errorCode] : @"Request failed — try again";
     if (message.length) [rows addObject:Row(message,@"none",NO)];
     if (busy) title=[title stringByAppendingString:@" — Loading…"];
@@ -463,6 +497,12 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     [_lastPresentedPlayerState release];
     _lastPresentedPlayerState=[_session.playback.currentState copy];
     [self displayVisual];
+    NSTimeInterval refreshDuration=[NSProcessInfo processInfo].systemUptime-refreshStart;
+    if(refreshDuration>0.075)
+        JFPosterTrace([NSString stringWithFormat:
+            @"PERF_REFRESH_SLOW page=%ld busy=%d duration_ms=%lld rows=%lu",
+            (long)page,busy,(long long)(refreshDuration*1000.0),
+            (unsigned long)rows.count]);
 }
 - (void)clearEditor {
     if (!_editor) return;
@@ -542,6 +582,20 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     } else [self setMessage:@"Check the server URL; HTTP requires Allow HTTP"];
     [secret release]; [self refreshView];
 }
+- (void)probeLibraryResponsiveness:(NSArray *)probe {
+    if(_closed || probe.count!=2)return;
+    NSTimeInterval start=[probe[0] doubleValue], expected=[probe[1] doubleValue];
+    NSTimeInterval now=[NSProcessInfo processInfo].systemUptime;
+    JFPosterTrace([NSString stringWithFormat:
+        @"PERF_MAINLOOP_WATCH expected_ms=%lld actual_ms=%lld lag_ms=%lld page=%ld busy=%d",
+        (long long)(expected*1000.0),(long long)((now-start)*1000.0),
+        (long long)(MAX(0.0,now-start-expected)*1000.0),
+        (long)[self phoneRemotePage],_session.busy]);
+}
+- (NSInteger)phoneRemotePage {
+    // Read-only model page: event processing stays on the main thread.
+    return _session ? [_session.snapshot[@"page"] integerValue] : -1;
+}
 - (void)synchronizeNativeSelection:(long)row {
     if (![NSThread isMainThread] || !_active || _closed || _editor || _session.busy || ![self rowSelectable:row]) return;
     if (_session && [_session.snapshot[@"page"] integerValue]!=JFLoginPage) return;
@@ -575,7 +629,15 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
             // Keep the visually selected tile in place until the new media
             // snapshot arrives. No intermediate model focus notification.
             NSString *kind=[collection isEqual:@"movies"]?@"Movie":@"Series";
-            JFPosterTrace([NSString stringWithFormat:@"LIBRARY_OPEN_ATOMIC index=%ld",(long)row]);
+            NSTimeInterval started=[NSProcessInfo processInfo].systemUptime;
+            JFPosterTrace([NSString stringWithFormat:
+                @"LIBRARY_OPEN_ATOMIC index=%ld uptime_ms=%lld",
+                (long)row,(long long)(started*1000.0)]);
+            // One-shot, low-overhead main-thread heartbeat. A 4–5 second UI
+            // stall is distinguishable from a slow but asynchronous HTTP fetch.
+            for(NSNumber *delay in @[@0.25,@1.0])
+                [self performSelector:@selector(probeLibraryResponsiveness:)
+                     withObject:@[@(started),delay] afterDelay:[delay doubleValue]];
             if (![_session openLibraryAtIndex:(NSUInteger)row type:kind]) {
                 [self setMessage:@"Browse request did not start"]; [self refreshView];
             }
@@ -609,7 +671,16 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
         if(![_session setDetailFlag:@"Favorite" enabled:!prior])[self setMessage:@"Cannot change favorite status"];
     }
     else if ([action isEqual:@"info"]) { /* Non-interactive metadata pane. */ }
-    else if ([action isEqual:@"refresh"]) [_session refresh];
+    else if ([action isEqual:@"refresh"]) {
+        JFPosterTrace([NSString stringWithFormat:@"LIBRARY_SCAN_BUTTON_ACTIVATED selected=%ld",(long)_selection]);
+        _pendingLibraryRefresh=YES;
+        if (![_session refresh]) {
+            _pendingLibraryRefresh=NO;
+            [self setMessage:@"Library refresh unavailable — try again"];
+            JFPosterTrace(@"LIBRARY_SCAN_REQUEST_REJECTED_LOCALLY");
+            [self refreshView];
+        }
+    }
     else if ([action isEqual:@"logout"]) { [self clearSessionCredential]; [_session signOut]; }
     else if ([action isEqual:@"play"]) [_session playDetail];
     else if ([action isEqual:@"pause"]) [_session.playback pause];
@@ -695,15 +766,15 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     if (page==JFLibrariesPage) {
         NSInteger count=[_session.snapshot[@"libraries"] count];
         if (old>=0 && old<count) {
-            if (b==JFLeft && old%2>0)next--;
-            if (b==JFRight && old%2<1 && old+1<count)next++;
-            if (b==JFUp)next=old>=2?old-2:count+(old%2);
-            if (b==JFDown && old+2<count)next=old+2;
+            if (b==JFLeft && old%4>0)next--;
+            if (b==JFRight && old%4<3 && old+1<count)next++;
+            if (b==JFUp)next=old>=4?old-4:count+(old%4>=(count>2?2:1)?1:0);
+            if (b==JFDown && old+4<count)next=old+4;
         } else {
             if (horizontal)next=b==JFLeft?count:count+1;
             if (b==JFDown && count) {
-                // Header left/right buttons map to left/right library cards.
-                NSInteger column=old==count+1?1:0;
+                // Header actions enter the left/right half of the first row.
+                NSInteger column=old==count+1?3:0;
                 next=MIN(column,count-1);
             }
         }
@@ -763,7 +834,14 @@ static NSData *JFPosterDataWithInset(NSData *data, BOOL sideInset) {
     if(next!=old && next>=0 && (NSUInteger)next<_rows.count && [self rowSelectable:next]) {
         _selection=next;
         if([_visual usingNativeFocus]) {
-            [self displayVisual];return YES;
+            // The common case is moving among the ten visible movie tiles.
+            // Do ONLY a compositor focus animation; a full renderSnapshot
+            // would synchronously probe posters and rebuild row captions.
+            if(page==JFMediaPage &&
+               [_visual animateMovieFocusOnlyWithSnapshot:_session.snapshot
+                    rows:_rows selection:_selection search:_searchActive])
+                return YES;
+            [self displayVisual];return YES; // row window changed or new page
         }
         NSDictionary *row=_rows[(NSUInteger)next];
         if([row[@"action"] isEqual:@"media"]) {

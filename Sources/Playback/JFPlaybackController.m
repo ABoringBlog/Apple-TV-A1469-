@@ -59,6 +59,10 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
 - (void)attachLocalSubtitleOverlayIfNeeded;
 - (void)updateLocalSubtitles;
 - (void)clearLocalSubtitles;
+- (BOOL)playItem:(NSString *)item startTicks:(long long)ticks
+ mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex
+ subtitleIndex:(NSInteger)subtitleIndex fallbackTier:(NSUInteger)tier;
+- (BOOL)retryAfterNativeFailure;
 @end
 @implementation JFPlaybackController
 @synthesize currentState=_state,errorKind=_errorKind,positionTicks=_position,progressCallback=_progress,failureCallback=_failure;
@@ -85,8 +89,11 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
     return [self playItem:item startTicks:ticks mediaSourceID:source audioIndex:audioIndex subtitleIndex:-1];
 }
 - (BOOL)playItem:(NSString *)item startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex {
+    return [self playItem:item startTicks:ticks mediaSourceID:source audioIndex:audioIndex subtitleIndex:subtitleIndex fallbackTier:0];
+}
+- (BOOL)playItem:(NSString *)item startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex fallbackTier:(NSUInteger)tier {
     BOOL boundSource=source!=nil, hasAudio=audioIndex>=0, hasSubtitle=subtitleIndex>=0;
-    if (![NSThread isMainThread] || _closed || [self active] || !JFMediaID(item) || !JFTicks(@(ticks)) ||
+    if (![NSThread isMainThread] || _closed || [self active] || tier>2 || !JFMediaID(item) || !JFTicks(@(ticks)) ||
         audioIndex < -1 || audioIndex>10000 || subtitleIndex < -1 || subtitleIndex>10000 ||
         (boundSource && !JFMediaID(source)) || (!boundSource && (hasAudio || hasSubtitle))) return NO;
     [self clearLocalSubtitles];
@@ -95,6 +102,7 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
     _subtitleIndex=subtitleIndex;
     [self retain]; _generation++; _position=ticks; _reportedStart=NO; _reportBusy=NO; _lastReported=ticks;
     [_plan release]; _plan=nil; [_macAudioRequest release]; _macAudioRequest=nil; _lastMacAudioSync=ticks; [_errorKind release]; _errorKind=[@"none" copy];
+    _playbackTier=tier; _retryAllowed=NO; _userStopping=NO;
     NSUInteger generation=_generation; JFClient *client=_client; JFPlaybackDelivery *delivery=_delivery;
     NSString *identifier=[[item copy] autorelease];
     NSString *selectedSource=[[source copy] autorelease];
@@ -107,7 +115,7 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
         // even though the Mac already has that exact track cached as AAC.
         // The chosen original audio index is separately validated and bound
         // to the Mac Bridge below; never replace it with the default track.
-        NSDictionary *info=[client playbackInfo:identifier startTicks:ticks mediaSourceID:selectedSource audioIndex:-1 subtitleIndex:-1 error:error];
+        NSDictionary *info=[client playbackInfo:identifier startTicks:ticks mediaSourceID:selectedSource audioIndex:-1 subtitleIndex:-1 fallbackTier:tier error:error];
         NSUInteger playbackInfoMillis=(NSUInteger)MAX(0,([NSProcessInfo processInfo].systemUptime-setupStarted)*1000.0);
         JFPlaybackTrace([NSString stringWithFormat:@"SETUP_PLAYBACKINFO_TIME ms=%lu",(unsigned long)playbackInfoMillis]);
         if (!info || JFWorkCancelled()) {
@@ -128,7 +136,7 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
                 [reason containsString:@"AudioCodecNotSupported"]) {
                 NSInteger videoAudio=JFVideoTransportAACIndex(info,selectedSource);
                 if (videoAudio>=0 && videoAudio!=audioIndex) {
-                    NSDictionary *alternate=[client playbackInfo:identifier startTicks:ticks mediaSourceID:selectedSource audioIndex:videoAudio subtitleIndex:-1 error:error];
+                    NSDictionary *alternate=[client playbackInfo:identifier startTicks:ticks mediaSourceID:selectedSource audioIndex:videoAudio subtitleIndex:-1 fallbackTier:tier error:error];
                     if (JFWorkCancelled()) return nil;
                     if (alternate) {
                         info=alternate;
@@ -142,6 +150,55 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
             JFPlaybackTrace([NSString stringWithFormat:@"SETUP_PLAN ok=0 kind=%@ code=%ld",JFPlaybackTraceKind(error),(long)JFPlaybackTraceCode(error)]);
             return nil;
         }
+        // Archived must keep its existing server-first behavior, including failure handling.
+        NSDictionary *sourceInfo=plan[@"source"];
+        NSString *serverPath=[sourceInfo[@"Path"] isKindOfClass:[NSString class]] ? sourceInfo[@"Path"] : @"";
+        // Apply to all normal Jellyfin media, including TV episodes. Archived
+        // remains outside this change regardless of its collection name.
+        BOOL archived=[serverPath containsString:@"/Archived/"] || [serverPath hasSuffix:@"/Archived"];
+        BOOL eligibleLibrary=[serverPath hasPrefix:@"/media/"] && !archived;
+        if (tier>0 && !eligibleLibrary) {
+            if (error) *error=[NSError errorWithDomain:@"ATV3PlaybackPolicy" code:2003 userInfo:nil];
+            return nil;
+        }
+        NSMutableDictionary *tierPlan=[[plan mutableCopy] autorelease];
+        NSUInteger actualTier=tier;
+        if (eligibleLibrary && !archived && tier==0) {
+            // For a source that cannot DP, normalize the existing server-first
+            // candidate stage to actual remux/transcode so a later failure
+            // cannot jump backward from transcode to remux.
+            if ([tierPlan[@"method"] isEqual:@"DirectStream"]) actualTier=1;
+            else if ([tierPlan[@"method"] isEqual:@"Transcode"]) actualTier=2;
+        }
+        if (eligibleLibrary && !archived && tier>0) {
+            BOOL canRemux=[tierPlan[@"videoRejectMask"] unsignedIntegerValue]==0 &&
+                JFVideoTransportAACIndex(info,tierPlan[@"sourceID"])>=0 &&
+                [sourceInfo[@"SupportsTranscoding"] boolValue] &&
+                [sourceInfo[@"TranscodingUrl"] isKindOfClass:[NSString class]] &&
+                [sourceInfo[@"TranscodingUrl"] length]>0;
+            if (tier==1 && canRemux) {
+                // The request builder sets VideoCodec=copy/AudioCodec=copy and both
+                // Allow*StreamCopy=true. Never mask a real encode as a remux.
+                tierPlan[@"method"]=@"DirectStream";
+                tierPlan[@"transportAudioStreamIndex"]=@(JFVideoTransportAACIndex(info,tierPlan[@"sourceID"]));
+                JFPlaybackTrace(@"PLAYBACK_FALLBACK_REMUX_COPY_ONLY");
+            } else {
+                if (tier==1) JFPlaybackTrace(@"PLAYBACK_FALLBACK_REMUX_UNAVAILABLE");
+                actualTier=2;
+                if (![sourceInfo[@"TranscodingUrl"] isKindOfClass:[NSString class]] || ![sourceInfo[@"TranscodingUrl"] length]) {
+                    if (error) *error=[NSError errorWithDomain:@"ATV3PlaybackPolicy" code:2004 userInfo:nil];
+                    return nil;
+                }
+                tierPlan[@"method"]=@"Transcode";
+                tierPlan[@"allowVideoCopy"]=@NO;
+                NSInteger transport=JFVideoTransportAACIndex(info,tierPlan[@"sourceID"]);
+                if (transport>=0) tierPlan[@"transportAudioStreamIndex"]=@(transport);
+                JFPlaybackTrace(@"PLAYBACK_FALLBACK_TRANSCODE");
+            }
+        }
+        tierPlan[@"autoFallbackEnabled"]=@(eligibleLibrary && !archived);
+        tierPlan[@"autoFallbackTier"]=@(actualTier);
+        plan=tierPlan;
         if (selectedSource) {
             NSMutableDictionary *bound=[[plan mutableCopy] autorelease];
             if (hasAudio) bound[@"audioStreamIndex"]=@(audioIndex);
@@ -183,6 +240,8 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
         if (!result) [owner fail:Kind(error)];
         else {
             owner->_plan=[result[@"plan"] copy];
+            owner->_retryAllowed=[owner->_plan[@"autoFallbackEnabled"] boolValue];
+            owner->_playbackTier=[owner->_plan[@"autoFallbackTier"] unsignedIntegerValue];
             [owner->_macAudioRequest release]; owner->_macAudioRequest=[result[@"request"] copy];
             JFBackendEvent callback=^(NSString *event,long long position) {
                 JFPlaybackController *target=delivery->owner;
@@ -300,7 +359,11 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
 }
 - (void)backendEvent:(NSString *)event ticks:(long long)ticks generation:(NSUInteger)generation {
     if (_closed || _generation!=generation || ![self active]) return;
-    if ([event isEqual:@"failure"]) { [self fail:@"playback"]; return; }
+    if ([event isEqual:@"failure"]) {
+        if ([self retryAfterNativeFailure]) return;
+        [self fail:@"playback"]; return;
+    }
+    if ([event isEqual:@"audio-failure"]) { [self fail:@"playback"]; return; }
     if ([event isEqual:@"started"]) {
         if (![_state isEqual:@"setup"] || !_plan) return;
         if (ticks>0 && JFTicks(@(ticks)) && ticks<=[_plan[@"durationTicks"] longLongValue]) _position=ticks;
@@ -404,6 +467,27 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
     }
     [self release]; return YES;
 }
+- (BOOL)retryAfterNativeFailure {
+    if (![NSThread isMainThread] || _closed || _userStopping ||
+        !_retryAllowed || !_plan || _playbackTier>=2 || ![self active]) return NO;
+    NSString *item=[[_plan[@"itemID"] copy] autorelease];
+    NSString *source=[[_plan[@"sourceID"] copy] autorelease];
+    NSNumber *chosen=_plan[@"audioStreamIndex"];
+    NSInteger audio=JFTicks(chosen) ? [chosen integerValue] : -1;
+    NSInteger subtitle=_subtitleIndex;
+    long long ticks=_position;
+    if (ticks<0 || !JFTicks(@(ticks)) || ticks>=[_plan[@"durationTicks"] longLongValue]) ticks=0;
+    NSUInteger next=_playbackTier+1;
+    JFPlaybackTrace([NSString stringWithFormat:@"PLAYBACK_FALLBACK_TRIGGER from=%lu to=%lu ticks=%lld",
+        (unsigned long)_playbackTier,(unsigned long)next,ticks]);
+    // Stop the previous gateway/native decoder/Mac audio session before constructing
+    // a new one. Generation IDs discard every late old callback.
+    if (![self stop]) return NO;
+    BOOL accepted=[self playItem:item startTicks:ticks mediaSourceID:source
+        audioIndex:audio subtitleIndex:subtitle fallbackTier:next];
+    JFPlaybackTrace([NSString stringWithFormat:@"PLAYBACK_FALLBACK_RESTART accepted=%d",accepted]);
+    return accepted;
+}
 - (BOOL)stop {
     if (![NSThread isMainThread] || _closed || ![self active]) return NO;
     [self retain]; [_setupTask cancel]; _generation++; // Reject synchronous/late backend callbacks before stop.
@@ -446,13 +530,15 @@ static NSString *JFPlaybackTraceKind(NSError **error) { return Kind(error && *er
 }
 @end
 @implementation JFMockPlaybackBackend
-@synthesize starts=_starts,stops=_stops;
-- (void)startRequest:(NSURLRequest *)request positionTicks:(long long)ticks event:(JFBackendEvent)event { [_event release]; _event=[event copy]; _starts++; }
+@synthesize starts=_starts,stops=_stops,lastRequest=_lastRequest;
+- (void)startRequest:(NSURLRequest *)request positionTicks:(long long)ticks event:(JFBackendEvent)event {
+    [_event release]; _event=[event copy]; [_lastRequest release]; _lastRequest=[request copy]; _starts++;
+}
 - (void)pause {}
 - (void)resume {}
 - (void)seek:(long long)ticks event:(JFBackendEvent)event { [_event release]; _event=[event copy]; }
 - (void)stop { _stops++; [_event release]; _event=nil; }
 - (void)emit:(NSString *)event ticks:(long long)ticks { JFBackendEvent callback=[_event copy]; if (callback) callback(event,ticks); [callback release]; }
 - (JFBackendEvent)capturedEvent { return [[_event copy] autorelease]; }
-- (void)dealloc { [_event release]; [super dealloc]; }
+- (void)dealloc { [_event release]; [_lastRequest release]; [super dealloc]; }
 @end

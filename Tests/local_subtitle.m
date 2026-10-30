@@ -15,8 +15,7 @@ int main(int argc, char **argv) { @autoreleasepool {
             NSString *relative=[line substringFromIndex:[@"SRT_NEEDS_REVIEW " length]];
             @autoreleasepool {
                 total++;
-                NSString *root=[[[NSProcessInfo processInfo] environment] objectForKey:@"JF_SRT_SCAN_ROOT"]?:@"/tmp/jellyfin-srt-fixture";
-                NSString *path=[root stringByAppendingPathComponent:relative];
+                NSString *path=[@"/Volumes/Shared/电影" stringByAppendingPathComponent:relative];
                 NSArray *cues=JFLocalSubtitleParse([NSData dataWithContentsOfFile:path],NULL);
                 if (cues.count)valid++;
                 else printf("STILL_UNSUPPORTED %s\n",[relative UTF8String]);

@@ -28,6 +28,8 @@ extern NSString * const JFPlaybackChanged;
     long long _lastMacAudioSync;
     NSString *_state, *_errorKind;
     NSUInteger _generation;
+    NSUInteger _playbackTier;
+    BOOL _retryAllowed, _userStopping;
     long long _position;
     BOOL _closed, _reportedStart, _reportBusy;
     long long _lastReported;
@@ -60,10 +62,12 @@ extern NSString * const JFPlaybackChanged;
 // Deliberately inert until tests call emit:; never decodes or opens a media URL.
 @interface JFMockPlaybackBackend : NSObject <JFPlaybackBackend> {
     JFBackendEvent _event;
+    NSURLRequest *_lastRequest;
     NSUInteger _starts, _stops;
 }
 @property(nonatomic, readonly) NSUInteger starts;
 @property(nonatomic, readonly) NSUInteger stops;
+@property(nonatomic, readonly) NSURLRequest *lastRequest;
 - (void)emit:(NSString *)event ticks:(long long)ticks;
 - (JFBackendEvent)capturedEvent;
 @end

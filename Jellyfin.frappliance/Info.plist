@@ -17,7 +17,7 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.5.101</string>
+	<string>0.5.102</string>
 	<key>CFBundleSignature</key>
 	<string>fnrw</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -25,7 +25,7 @@
 		<string>iPhoneOS</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.5.101</string>
+	<string>0.5.102</string>
 	<key>FRApplianceDataSourceType</key>
 	<string>All</string>
 	<key>FRApplianceName</key>

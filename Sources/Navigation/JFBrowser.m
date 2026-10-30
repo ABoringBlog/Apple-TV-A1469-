@@ -1,4 +1,5 @@
 #import "JFBrowser.h"
+#import "../JFPosterTrace.h"
 static const NSUInteger JFMediaPageSize=100;
 // We fetch server pages privately, but never expose a partial list to BackRow.
 // Fail explicitly if a server returns an unreasonable amount of data rather
@@ -66,6 +67,11 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
         if ([[[_libraries objectAtIndex:i] objectForKey:@"Id"] isEqual:selectedID]) { _index=(NSInteger)i; break; }
     }
     [selectedID release]; _page=JFLibrariesPage; return YES;
+}
+- (BOOL)refreshAndScan:(NSError **)error {
+    // Network worker only. Fail visibly if current Jellyfin user cannot scan.
+    if (![_client requestLibraryScan:error]) return NO;
+    return [self refreshUncached:error];
 }
 - (BOOL)refreshUncached:(NSError **)error {
     // Explicit refresh is opt-in and invalidates future catalog fast-path reads
@@ -136,8 +142,17 @@ static NSArray *JFAppendUniqueMedia(NSArray *existing, NSArray *page) {
     if(!ident || ![@[@"Movie",@"Series"] containsObject:type])return NO;
     // Use a genuinely small first request: 10 visible items + 1 lookahead.
     // Remaining pages are appended after the UI is already interactive.
+    NSTimeInterval fetchStart=[NSProcessInfo processInfo].systemUptime;
+    JFPosterTrace([NSString stringWithFormat:
+        @"PERF_LIBRARY_FETCH_START uptime_ms=%lld limit=11",
+        (long long)(fetchStart*1000.0)]);
     NSArray *page=[_client itemsInLibrary:ident type:type
                               start:0 limit:11 error:error];
+    NSTimeInterval fetchEnd=[NSProcessInfo processInfo].systemUptime;
+    JFPosterTrace([NSString stringWithFormat:
+        @"PERF_LIBRARY_FETCH_DONE duration_ms=%lld count=%lu error=%ld",
+        (long long)((fetchEnd-fetchStart)*1000.0),
+        (unsigned long)page.count,(long)(error&&*error?(*error).code:0)]);
     if(!page)return [self mediaFailed];
     NSArray *first=JFVisiblePage(page);
     NSArray *visible=[first subarrayWithRange:NSMakeRange(0,MIN((NSUInteger)10,first.count))];

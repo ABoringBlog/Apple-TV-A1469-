@@ -32,7 +32,12 @@ static NSDictionary *LastBody;
         else if ([mode isEqual:@"malformed"]) body=@{@"MediaSources":@"wrong"};
         else if ([mode isEqual:@"empty"]) body=@{@"PlaySessionId":@"play1",@"MediaSources":@[]};
         else if ([mode isEqual:@"oversized"]) body=[NSMutableData dataWithLength:8*1024*1024+1];
-        else body=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@"Tests/playback.json"] options:0 error:NULL];
+        else {
+            body=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:@"Tests/playback.json"] options:NSJSONReadingMutableContainers error:NULL];
+            if ([mode isEqual:@"fallback-movie"]) body[@"MediaSources"][0][@"Path"]=@"/media/电影/普通电影/Fixture/movie.mp4";
+            if ([mode isEqual:@"fallback-tv"]) body[@"MediaSources"][0][@"Path"]=@"/media/电视剧/Fixture/episode.mp4";
+            if ([mode isEqual:@"fallback-archived"]) body[@"MediaSources"][0][@"Path"]=@"/media/Archived/Fixture/movie.mp4";
+        }
     } else if ([path containsString:@"/Sessions/Playing"]) {
         @synchronized([self class]) { [Reports addObject:@{@"path":path,@"body":[NSJSONSerialization JSONObjectWithData:r.HTTPBody options:0 error:NULL] ?: @{}}]; }
         status=[mode isEqual:@"report401"] ? 401 : 204;

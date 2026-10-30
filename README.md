@@ -1,6 +1,4 @@
 # Apple TV 3 Modernization
-ALL WORK DONE BY CHATGPT
-所有的工作都是ChatGPT完成的
 
 [English-only README](README_EN.md)
 
@@ -12,7 +10,7 @@ Independent open-source applications for **jailbroken Apple TV 3 (A1469 / AppleT
 
 | App | Description / 功能 | Release |
 | --- | --- | --- |
-| **[RetroReel3](#retroreel3-jellyfin-client)** | Independent, unofficial native client for Jellyfin / 非官方 Jellyfin 原生客户端 | [v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1) |
+| **[RetroReel3](#retroreel3-jellyfin-client)** | Independent, unofficial native client for Jellyfin / 非官方 Jellyfin 原生客户端 | [v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.102-public1) |
 | **[Clock](Clock/)** | Native standalone clock / 原生独立时钟 | [clock-v0.1.5](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/clock-v0.1.5) |
 | **[Weather](Weather/)** | Native weather, English + 中文; requires Mac ATV3Bridge 24/7 / 原生天气，依赖 Mac 24 小时桥接 | [weather-v1.0.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/weather-v1.0.0-public2) |
 | **[Radio](Radio/)** | Native Internet Radio, English + 中文; requires Mac ATV3Bridge Radio / 原生网络电台，依赖 Mac Bridge | [radio-v0.3.1-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/radio-v0.3.1-public2) |
@@ -34,7 +32,7 @@ Independent open-source applications for **jailbroken Apple TV 3 (A1469 / AppleT
 
 ## RetroReel3 (Jellyfin client)
 
-**Current ATV3 Jellyfin release: v0.5.101-public1.** Newly verified user-facing work includes progressive 10-item library first-screen, native animated poster/text scrolling, compact two-column Library selection, an up-to-1 GiB persistent image/catalog cache, and native cover fades. Public builds use a configurable Mac Audio Bridge endpoint. See [full release notes / 详细说明](docs/jellyfin-v0.5.101-public1.md) for requirements, limitations, and installation. Older development-phase notes below describe historical milestones, not the current device validation.
+**Current ATV3 Jellyfin release: v0.5.102-public1.** **Four Library covers per row / 每行四个 Library**, with corresponding native focus and navigation. Includes newer development UI and playback lifecycle fixes; long-run stability is not certified. **Audio is output by a separate Mac ATV3 Audio Bridge**, while video and UI run on ATV3. The DEB alone cannot supply Mac audio: users need an awake Mac with a compatible paired bridge. Private bridge services and pairing credentials are not included. See [release notes / 发布说明](docs/jellyfin-v0.5.102-public1.md).
 
 ![RetroReel3 original app icon](Jellyfin.frappliance/AppIcon.png)
 
@@ -58,9 +56,9 @@ Native Jellyfin appliance for jailbroken **Apple TV 3 (A1469 / AppleTV3,2)**. No
 
 ### Install / 安装
 
-Download the `.deb` file and `SHA256SUMS` from the [RetroReel3 v0.5.101 Release](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1). On your Mac/Linux computer, verify the SHA256 listed in `SHA256SUMS`, then run:
+Download the `.deb` file and `SHA256SUMS` from the [RetroReel3 v0.5.102 Release](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.102-public1). On your Mac/Linux computer, verify the SHA256 listed in `SHA256SUMS`, then run:
 
-从 RetroReel3 v0.5.101 Release 下载 `.deb` 和 `SHA256SUMS`，先校验哈希，再在 Mac/Linux 终端执行：
+从 RetroReel3 v0.5.102 Release 下载 `.deb` 和 `SHA256SUMS`，先校验哈希，再在 Mac/Linux 终端执行：
 
 ```sh
 scp org.jellyfin.atv3_0.5.101-public1_iphoneos-arm.deb root@APPLE_TV_IP:/var/root/

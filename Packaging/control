@@ -1,7 +1,7 @@
 Package: org.jellyfin.atv3
 Name: RetroReel3
-Version: 0.5.101-public1
+Version: 0.5.102-public1
 Architecture: iphoneos-arm
-Description: Unofficial Jellyfin native client, fast cached libraries; requires separately configured Mac audio bridge
+Description: Unofficial ATV3 Jellyfin native client; Mac audio bridge required
 Maintainer: ABoringBlog
 Section: Multimedia

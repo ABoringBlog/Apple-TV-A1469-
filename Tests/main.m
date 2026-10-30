@@ -181,6 +181,10 @@ int main(int argc,char **argv) { @autoreleasepool {
     NSError *error=nil; CHECK(![c libraries:&error] && error.code==1004);
     CHECK([[[c serverInfo:&error] objectForKey:@"ServerName"] isEqual:@"测试服务器"]);
     CHECK([c login:@"测试用户" password:@"p\"ass" error:&error]);
+    CHECK([[c currentUser:&error][@"PrimaryImageTag"] isEqual:@"tag001"]);
+    NSData *latestAvatar=[c freshCurrentAvatarWithTag:@"tag001" width:180 error:&error];
+    CHECK(latestAvatar.length>0);
+    CHECK(![c freshCurrentAvatarWithTag:@"../../bad" width:180 error:&error] && error.code==1007);
     NSArray *items=[c libraries:&error]; CHECK(items.count==1); CHECK([[[items objectAtIndex:0] objectForKey:@"Name"] isEqual:@"电影"]);
     CHECK(![c login:@"bad" password:@"x" error:&error] && error.code==401); CHECK(![c libraries:&error]);
     CHECK(![c login:@"shape" password:@"x" error:&error] && error.code==1003);

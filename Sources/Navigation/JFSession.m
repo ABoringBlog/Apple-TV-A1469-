@@ -33,6 +33,9 @@ static NSString *ErrorKind(NSError *error) {
 - (id)initWithOwnedClient:(JFClient *)client;
 - (BOOL)submit:(void (^)(JFBrowser *, NSError **))action;
 - (void)queueNextLibraryChunk;
+- (void)setScanMessage:(NSString *)message;
+- (void)scheduleScanCheck:(NSUInteger)generation after:(NSTimeInterval)delay;
+- (void)checkScanStatus:(NSUInteger)generation;
 - (BOOL)submitAuthentication:(void (^)(JFBrowser *, NSError **))action;
 - (void)interruptPosterLoad;
 - (void)clearPoster;
@@ -46,6 +49,7 @@ static NSString *ErrorKind(NSError *error) {
 - (NSDictionary *)defaultAudioTrackForSource:(NSString *)source tracks:(NSArray *)tracks;
 @end
 @implementation JFSession
+@synthesize scanStatus=_scanStatus;
 @synthesize snapshot=_snapshot, errorKind=_errorKind, errorDomain=_errorDomain, errorCode=_errorCode, busy=_busy, closed=_closed;
 - (NSString *)sessionToken { return [[_sessionToken copy] autorelease]; }
 - (NSData *)posterData { return [[_posterData copy] autorelease]; }
@@ -394,8 +398,19 @@ static NSString *ErrorKind(NSError *error) {
         [session->_errorDomain release]; session->_errorDomain=[error.domain copy]; session->_errorCode=error.code;
         if ([kind isEqual:@"authentication"]) { [session->_sessionToken release]; session->_sessionToken=nil; }
         session->_busy=NO;
+        BOOL scanAccepted=session->_scanAwaitAcceptance;
+        if (scanAccepted) {
+            session->_scanAwaitAcceptance=NO;
+            if (error) {
+                [session setScanMessage:error.code==403?
+                    @"Scan denied: administrator permission required":@"Scan request failed"];
+            } else {
+                [session setScanMessage:@"Scan requested. Checking server task..."];
+            }
+        }
         [session updatePosterForSnapshot];
         [session publish];
+        if (scanAccepted && !error) [session scheduleScanCheck:session->_scanGeneration after:1.0];
         [session queueNextLibraryChunk];
     }];
     [self publish]; return YES;
@@ -428,21 +443,118 @@ static NSString *ErrorKind(NSError *error) {
     if (![NSThread isMainThread] || _closed || ![username isKindOfClass:[NSString class]] || !username.length || ![password isKindOfClass:[NSString class]]) return NO;
     // Copy mutable caller inputs before crossing threads.
     NSString *name=[[username copy] autorelease], *secret=[[password copy] autorelease];
-    _generation++; [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
+    _generation++; _scanGeneration++;_scanAwaitAcceptance=NO;
+    [self setScanMessage:nil];[_scanRequestedAt release];_scanRequestedAt=nil;
+    [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
     [_sessionToken release]; _sessionToken=nil;
     return [self submitAuthentication:^(JFBrowser *browser, NSError **error) { [browser login:name password:secret error:error]; }];
 }
 - (BOOL)authenticateToken:(NSString *)token {
     if (![NSThread isMainThread] || _closed || ![token isKindOfClass:[NSString class]] || !token.length) return NO;
     NSString *credential=[[token copy] autorelease];
-    _generation++; [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
+    _generation++; _scanGeneration++;_scanAwaitAcceptance=NO;
+    [self setScanMessage:nil];[_scanRequestedAt release];_scanRequestedAt=nil;
+    [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
     [_sessionToken release]; _sessionToken=nil;
     return [self submitAuthentication:^(JFBrowser *browser, NSError **error) { [browser authenticateToken:credential error:error]; }];
+}
+static BOOL JFScanEndedAfterRequest(NSString *value, NSDate *requested) {
+    if (![value isKindOfClass:[NSString class]] || value.length<19 || !requested) return NO;
+    NSDateFormatter *format=[[[NSDateFormatter alloc] init] autorelease];
+    [format setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
+    [format setTimeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+    [format setDateFormat:@"yyyy-MM-dd'T'HH:mm:ss"];
+    NSDate *end=[format dateFromString:[value substringToIndex:19]];
+    // If clock skew makes this indeterminate, do not invent a completion.
+    return end && [end timeIntervalSinceDate:requested]>=-3.0;
+}
+- (void)setScanMessage:(NSString *)message {
+    if ((_scanStatus==message) || [_scanStatus isEqualToString:message]) return;
+    [_scanStatus release];_scanStatus=[message copy];
+}
+- (void)scheduleScanCheck:(NSUInteger)generation after:(NSTimeInterval)delay {
+    if (_closed || generation!=_scanGeneration) return;
+    JFSessionDelivery *delivery=_delivery;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),
+                   dispatch_get_main_queue(),^{
+        JFSession *owner=delivery->owner;
+        if (owner && !owner->_closed && owner->_scanGeneration==generation)
+            [owner checkScanStatus:generation];
+    });
+}
+- (void)checkScanStatus:(NSUInteger)generation {
+    if (_closed || generation!=_scanGeneration) return;
+    _scanPollCount++;
+    JFClient *client=_playbackClient;
+    JFSessionDelivery *delivery=_delivery;
+    [_worker perform:^id(NSError **error) {return [client libraryScanTask:error];}
+           completion:^(id result,NSError *error) {
+        JFSession *owner=delivery->owner;
+        if (!owner || owner->_closed || owner->_scanGeneration!=generation) return;
+        BOOL again=NO;
+        if (error || ![result isKindOfClass:[NSDictionary class]]) {
+            JFPosterTrace([NSString stringWithFormat:@"LIBRARY_SCAN_STATUS_QUERY_FAILED code=%ld",(long)error.code]);
+            owner->_scanQueryFailures++;
+            if (owner->_scanQueryFailures<=2) {
+                [owner setScanMessage:@"Scan requested; checking server status..."];
+                again=YES;
+            } else {
+                [owner setScanMessage:@"Scan accepted; progress unavailable"];
+            }
+        } else {
+            owner->_scanQueryFailures=0;
+            NSString *state=result[@"state"];
+            BOOL running=[state isEqualToString:@"Running"];
+            BOOL idle=[state isEqualToString:@"Idle"];
+            JFPosterTrace([NSString stringWithFormat:@"LIBRARY_SCAN_TASK state=%@ progress=%@ result=%@",
+                state?:@"Unknown",result[@"progress"]?:@"missing",result[@"lastStatus"]?:@"unknown"]);
+            if (running) {
+                owner->_scanObservedRunning=YES;
+                if (owner->_scanPollCount>=600) {
+                    [owner setScanMessage:@"Scan still running — check Dashboard"];
+                } else {
+                NSNumber *progress=result[@"progress"];
+                double percent=[progress isKindOfClass:[NSNumber class]]?[progress doubleValue]:-1;
+                if (isfinite(percent) && percent>=0 && percent<=100)
+                    [owner setScanMessage:[NSString stringWithFormat:@"Scanning media library: %.0f%%",percent]];
+                else [owner setScanMessage:@"Scanning media library..."];
+                again=YES;
+                }
+            } else if (idle) {
+                BOOL recent=JFScanEndedAfterRequest(result[@"lastEnd"],owner->_scanRequestedAt);
+                if (owner->_scanObservedRunning || recent) {
+                    NSString *outcome=result[@"lastStatus"];
+                    if ([outcome isEqualToString:@"Completed"])
+                        [owner setScanMessage:@"Library scan completed. Open Archived."];
+                    else if ([outcome isEqualToString:@"Failed"])
+                        [owner setScanMessage:@"Library scan failed — check Jellyfin dashboard"];
+                    else if ([outcome isEqualToString:@"Cancelled"])
+                        [owner setScanMessage:@"Library scan was cancelled"];
+                    else [owner setScanMessage:@"Scan finished; result not reported"];
+                } else if (owner->_scanPollCount<16) {
+                    [owner setScanMessage:@"Scan requested; waiting for server to start..."];
+                    again=YES;
+                } else {
+                    [owner setScanMessage:@"Scan accepted; completion not verified"];
+                }
+            } else if (owner->_scanPollCount<600) {
+                [owner setScanMessage:@"Scan task state pending..."];
+                again=YES;
+            } else [owner setScanMessage:@"Scan state unavailable — check Dashboard"];
+        }
+        [owner publish];
+        if (again && owner->_scanPollCount<600)
+            [owner scheduleScanCheck:generation after:3.0];
+    }];
 }
 - (BOOL)refresh {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
     if ([_snapshot[@"page"] integerValue]!=JFLibrariesPage) return NO;
-    return [self submit:^(JFBrowser *browser, NSError **error) { [browser refreshUncached:error]; }];
+    ++_scanGeneration; _scanPollCount=0; _scanQueryFailures=0;
+    _scanAwaitAcceptance=YES;_scanObservedRunning=NO;
+    [_scanRequestedAt release];_scanRequestedAt=[[NSDate date] retain];
+    [self setScanMessage:@"Requesting media library scan..."];
+    return [self submit:^(JFBrowser *browser, NSError **error) { [browser refreshAndScan:error]; }];
 }
 - (BOOL)openLibraryWithType:(NSString *)type {
     if (![NSThread isMainThread] || _closed || _busy) return NO;
@@ -594,19 +706,23 @@ static NSString *ErrorKind(NSError *error) {
 }
 - (BOOL)signOut {
     if (![NSThread isMainThread] || _closed) return NO;
-    _generation++; [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
+    _generation++; _scanGeneration++;_scanAwaitAcceptance=NO;
+    [self setScanMessage:nil];[_scanRequestedAt release];_scanRequestedAt=nil;
+    [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
     [_sessionToken release]; _sessionToken=nil;
     return [self submit:^(JFBrowser *browser, NSError **error) { [browser signOut:error]; }];
 }
 - (BOOL)logout {
     if (![NSThread isMainThread] || _closed) return NO;
-    _generation++; [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
+    _generation++; _scanGeneration++;_scanAwaitAcceptance=NO;
+    [self setScanMessage:nil];[_scanRequestedAt release];_scanRequestedAt=nil;
+    [_worker cancelAll]; [_playback invalidateSession]; _busy=NO; [self resetSnapshot];
     [_sessionToken release]; _sessionToken=nil;
     return [self submit:^(JFBrowser *browser, NSError **error) { [browser logout]; }];
 }
 - (void)close {
     if (![NSThread isMainThread] || _closed) return;
-    _closed=YES; _generation++; _busy=NO;
+    _closed=YES; _generation++;_scanGeneration++; _busy=NO;
     [self clearPoster];
     if (_delivery) _delivery->owner=nil;
     [_worker cancelAll];
@@ -623,6 +739,7 @@ static NSString *ErrorKind(NSError *error) {
     [_posterTask release]; [_posterData release]; [_posterItemID release];
     [_audioItemID release]; [_audioSourceID release];
     [_subtitleItemID release]; [_subtitleSourceID release];
-    [_snapshot release]; [_errorKind release]; [_errorDomain release]; [_sessionToken release]; [super dealloc];
+    [_snapshot release]; [_scanStatus release];[_scanRequestedAt release];
+    [_errorKind release]; [_errorDomain release]; [_sessionToken release]; [super dealloc];
 }
 @end

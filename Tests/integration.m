@@ -41,6 +41,11 @@ int main(void) { @autoreleasepool {
     @try {
     NSArray *libraries=[client libraries:&error];
     if (Report(libraries!=nil,"authenticated libraries",error)) return 1;
+    if (fixture) {
+        NSDictionary *task=[client libraryScanTask:&error];
+        if (Report([task[@"state"] isEqual:@"Running"] && [task[@"progress"] intValue]==42,
+                   "authenticated read-only library scan status",error)) return 1;
+    }
     if ([config[@"library"] length]) {
         NSArray *items=[client itemsInLibrary:config[@"library"] type:@"Movie" start:0 limit:1 error:&error];
         if (Report(items!=nil && (!fixture || (items.count==1 && [items[0][@"Id"] isEqual:@"movie1"])),"first media page",error)) return 1;

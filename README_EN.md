@@ -10,7 +10,7 @@ Each application is independently installable, has its own package ID and releas
 
 | App | Description | Current release |
 | --- | --- | --- |
-| **RetroReel3** | Independent, unofficial native Jellyfin client | [v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1) |
+| **RetroReel3** | Independent, unofficial native Jellyfin client | [v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.102-public1) |
 | **Clock** | Native standalone Apple TV 3 clock | [clock-v0.1.5](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/clock-v0.1.5) |
 | **Weather** | Native weather in English or Chinese; requires Mac ATV3Bridge 24/7 | [weather-v1.0.0-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/weather-v1.0.0-public2) |
 | **Radio** | Native Internet Radio in English or Chinese; requires Mac ATV3Bridge Radio | [radio-v0.3.1-public2](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/radio-v0.3.1-public2) |
@@ -28,7 +28,7 @@ Each application is independently installable, has its own package ID and releas
 
 ## RetroReel3
 
-**Current ATV3 Jellyfin release: v0.5.101-public1.** Newly verified user-facing work includes progressive 10-item library first-screen, native animated poster/text scrolling, compact two-column Library selection, an up-to-1 GiB persistent image/catalog cache, and native cover fades. Public builds use a configurable Mac Audio Bridge endpoint. See [full release notes / 详细说明](docs/jellyfin-v0.5.101-public1.md) for requirements, limitations, and installation. Older development-phase notes below describe historical milestones, not the current device validation.
+**Current ATV3 Jellyfin release: v0.5.102-public1.** **Four Library covers per row / 每行四个 Library**, with corresponding native focus and navigation. Includes newer development UI and playback lifecycle fixes; long-run stability is not certified. **Audio is output by a separate Mac ATV3 Audio Bridge**, while video and UI run on ATV3. The DEB alone cannot supply Mac audio: users need an awake Mac with a compatible paired bridge. Private bridge services and pairing credentials are not included. See [release notes / 发布说明](docs/jellyfin-v0.5.102-public1.md).
 
 ![RetroReel3 original app icon](Jellyfin.frappliance/AppIcon.png)
 
@@ -46,7 +46,7 @@ Tested target:
 - Build 12H1006
 - iOS 8.4.4 base system
 
-The native playback baseline was verified on physical hardware. The private 0.5.101 device UI was verified on physical hardware. This public build replaces the site-specific Mac bridge address with a user-configurable plist and has not received separate physical-device acceptance.
+The native playback baseline was verified on physical hardware. Earlier private versions were exercised on hardware. The new four-column public build is not claimed to have long-duration or physical A/V-sync acceptance.
 
 Other Apple TV models, firmware builds, and jailbreak environments are not validated.
 
@@ -71,7 +71,7 @@ Selecting subtitles may cause the server to transcode video depending on media a
 
 Download the package and SHA256SUMS from:
 
-**[RetroReel3 v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.101-public1)**
+**[RetroReel3 v0.5.101-public1](https://github.com/ABoringBlog/Apple-TV-A1469-Jellyfin-Client-and-some-plugins/releases/tag/v0.5.102-public1)**
 
 ### Installation
 

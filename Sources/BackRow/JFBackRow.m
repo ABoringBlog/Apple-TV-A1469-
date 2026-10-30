@@ -7,9 +7,97 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <string.h>
-static char remoteKey, menuKey;
+static char remoteKey, menuKey, mobileGestureKey;
+// The 12H1006 touch remote reports touch begin/move/end (32/33/34),
+// then a directional gesture action and a terminal event (39..42).
+// Model navigation must occur at most once per phone gesture. These are
+// appliance-owned objects: do NOT modify BackRow or other applications.
+@interface JFMobileGestureState : NSObject {
+@public
+    BOOL touching;
+    NSTimeInterval lastTouchAt, lastNativeAt, lastGestureAt;
+    NSInteger lastNativeButton, lastGestureButton;
+    id selectController; // Assign: controller owns this state; cancelled on exit.
+    BOOL selectPending;
+    NSInteger seenPage, selectArmedOnPage;
+    BOOL pageKnown, firstPhoneSelectGuard, nativeLibrarySelectArmed;
+}
+- (void)armSelectForController:(id)controller;
+- (void)cancelPendingSelect;
+@end
+@implementation JFMobileGestureState
+- (void)armSelectForController:(id)controller {
+    // Phone touchpads can emit a Select just before a swipe. Do not activate
+    // media content until we know the gesture did not follow.
+    if (selectPending) return; // duplicate Select within a pending touch burst
+    selectController=controller;
+    JFUIController *ui=(JFUIController *)objc_getAssociatedObject(controller,&menuKey);
+    selectArmedOnPage=ui ? [ui phoneRemotePage] : -1;
+    selectPending=YES;
+    [self performSelector:@selector(deliverPendingSelect) withObject:nil afterDelay:0.35];
+}
+- (void)cancelPendingSelect {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+        selector:@selector(deliverPendingSelect) object:nil];
+    selectPending=NO;
+    selectController=nil;
+}
+- (void)deliverPendingSelect {
+    if (!selectPending || !selectController) return;
+    id controller=selectController;
+    NSInteger oldPage=selectArmedOnPage;
+    selectPending=NO;selectController=nil;
+    JFUIController *ui=(JFUIController *)objc_getAssociatedObject(controller,&menuKey);
+    if (!ui || [ui phoneRemotePage]!=oldPage) {
+        JFPosterTrace(@"PHONE_SELECT_DROPPED_PAGE_CHANGED");
+        return;
+    }
+    JFBRMenu *menu=objc_getAssociatedObject(controller,&menuKey);
+    if (menu) {
+        JFPosterTrace(@"PHONE_SELECT_CONFIRMED");
+        (void)[menu handleEvent:@{@"button":@(JFSelect),@"phase":@"press"}];
+    }
+}
+@end
+
+static NSInteger JFMobileSwipeButton(NSInteger action) {
+    switch(action) {
+        case 39:return JFLeft;
+        case 40:return JFRight;
+        case 41:return JFUp;
+        case 42:return JFDown;
+        default:return JFUnknown;
+    }
+}
+static JFMobileGestureState *JFMobileState(id controller) {
+    JFMobileGestureState *state=objc_getAssociatedObject(controller,&mobileGestureKey);
+    if (!state) {
+        state=[[[JFMobileGestureState alloc] init] autorelease];
+        objc_setAssociatedObject(controller,&mobileGestureKey,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return state;
+}
+void JFBRResetRemoteForPageChange(id controller) {
+    if (!controller) return;
+    objc_setAssociatedObject(controller,&remoteKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    JFMobileGestureState *state=objc_getAssociatedObject(controller,&mobileGestureKey);
+    // Clear only held buttons and postponed activation, not the origin of
+    // the event which navigated from Libraries to Media. That origin is needed
+    // to discard the 12H1006 late origin3 Select echo on the next page.
+    if (state) {
+        [state cancelPendingSelect];
+        state->touching=NO;
+        state->lastNativeAt=0;
+        state->lastGestureAt=0;
+        state->lastNativeButton=0;
+        state->lastGestureButton=0;
+    }
+}
 void JFBRClearRemoteState(id controller) {
-    if (controller) objc_setAssociatedObject(controller,&remoteKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (controller) {
+        JFBRResetRemoteForPageChange(controller);
+        objc_setAssociatedObject(controller,&mobileGestureKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 static BOOL menuEnabled;
 static BOOL Signature(id target, SEL sel, const char *result, NSArray *args) {
@@ -30,19 +118,50 @@ id JFBRObjectWithObject(id target, NSString *name, id argument) {
     return ((id(*)(id,SEL,id))objc_msgSend)(target,sel,argument);
 }
 // 12H1006 BREvent: action/value int32, originator uint32.
-static BOOL Integer(id target, NSString *name, const char *type, NSInteger *out) {
-    SEL sel=NSSelectorFromString(name);
-    if (!Signature(target,sel,type,@[])) return NO;
-    NSInvocation *v=[NSInvocation invocationWithMethodSignature:[target methodSignatureForSelector:sel]];
-    [v setTarget:target]; [v setSelector:sel]; [v invoke];
-    if (!strcmp(type,"I")) {
-        uint32_t value=0; [v getReturnValue:&value];
-        if ((uint64_t)value>(uint64_t)NSIntegerMax) return NO;
-        *out=(NSInteger)value;
-    } else { int32_t value=0; [v getReturnValue:&value]; *out=value; }
+// Phone swipes produce many touch-move events. The old path allocated an
+// NSInvocation and verified all three signatures MULTIPLE TIMES per event.
+// Verify the exact firmware ABI once for each concrete event class, then read
+// its three integer getters once. Do not weaken the incompatible-ABI guard.
+static BOOL JFDecodeEvent(id event,NSInteger *origin,NSInteger *action,NSInteger *value) {
+    static Class lastClass=Nil;
+    static BOOL lastValid=NO;
+    Class cls=object_getClass(event);
+    if (!cls || !event) return NO;
+    if (cls!=lastClass) {
+        lastValid=Signature(event,NSSelectorFromString(@"originator"),@encode(unsigned),@[]) &&
+                  Signature(event,NSSelectorFromString(@"remoteAction"),@encode(int),@[]) &&
+                  Signature(event,NSSelectorFromString(@"value"),@encode(int),@[]);
+        lastClass=cls;
+    }
+    if(!lastValid)return NO;
+    *origin=((unsigned(*)(id,SEL))objc_msgSend)(event,NSSelectorFromString(@"originator"));
+    *action=((int(*)(id,SEL))objc_msgSend)(event,NSSelectorFromString(@"remoteAction"));
+    *value=((int(*)(id,SEL))objc_msgSend)(event,NSSelectorFromString(@"value"));
     return YES;
 }
-static IMP ControllerSuper(SEL selector) {
+// Keep source event timestamps for first touch/completed swipes. This is
+// logging only: BREvent.timeStamp can use a different clock on some firmware.
+static void JFTraceSourceTime(id event,NSInteger origin,NSInteger action) {
+    // Modern phone remotes can synthesize origin=1 traditional key events,
+    // so capture their BREvent producer timestamps too. Skip high-rate moves.
+    if((origin!=1 && origin!=3) ||
+       !(action==1 || action==3 || action==4 || action==5 ||
+         action==6 || action==7 || action==32 || action==34 ||
+         action==39 || action==40 || action==41 || action==42))return;
+    SEL sel=NSSelectorFromString(@"timeStamp");
+    static Class timestampClass=Nil;
+    static BOOL timestampValid=NO;
+    Class cls=object_getClass(event);
+    if(cls!=timestampClass) {
+        timestampValid=Signature(event,sel,@encode(double),@[]);
+        timestampClass=cls;
+    }
+    if(!timestampValid)return;
+    double stamp=((double(*)(id,SEL))objc_msgSend)(event,sel);
+    JFPosterTrace([NSString stringWithFormat:
+        @"REMOTE_SOURCE_TIME origin=%ld action=%ld source=%.3f received_uptime=%.3f",
+        (long)origin,(long)action,stamp,[NSProcessInfo processInfo].systemUptime]);
+}static IMP ControllerSuper(SEL selector) {
     Class base=class_getSuperclass(objc_getClass("JellyfinController"));
     return class_getMethodImplementation(base,selector);
 }
@@ -161,17 +280,18 @@ static void Activated(id self, SEL cmd) {
 static void Deactivated(id self, SEL cmd) {
     AppSaverSet(NO);
     [objc_getAssociatedObject(self,&menuKey) deactivate];
-    objc_setAssociatedObject(self,&remoteKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    JFBRClearRemoteState(self);
     ((void(*)(id,SEL))ControllerSuper(cmd))(self,cmd);
 }
 static void Popped(id self, SEL cmd) {
+    JFBRClearRemoteState(self);
     [objc_getAssociatedObject(self,&menuKey) close];
     ((void(*)(id,SEL))ControllerSuper(cmd))(self,cmd);
 }
 static void ControllerDealloc(id self, SEL cmd) {
     [objc_getAssociatedObject(self,&menuKey) close];
     objc_setAssociatedObject(self,&menuKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self,&remoteKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    JFBRClearRemoteState(self);
     ((void(*)(id,SEL))ControllerSuper(cmd))(self,cmd);
 }
 static void ItemSelected(id self, SEL cmd, long row) { (void)self; (void)cmd; (void)row; }
@@ -183,19 +303,141 @@ static id Preview(id self, SEL cmd, long row) {
 }
 static BOOL Event(id self,SEL cmd,id event) {
     if (![NSThread isMainThread]) return NO;
-    NSInteger action,value,origin;
-    if (Integer(event,@"originator","I",&origin) && Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
-        JFPosterTrace([NSString stringWithFormat:@"REMOTE_PROBE origin=%ld action=%ld value=%ld",(long)origin,(long)action,(long)value]);
+    NSInteger action=0,value=0,origin=0;
+    BOOL decoded=JFDecodeEvent(event,&origin,&action,&value);
+    if (decoded) {
+        // Action 33 is unbounded touch-motion telemetry, never a discrete key.
+        // Synchronous logging of every 33 slowed the Apple A5 phone path.
+        if(!(origin==3 && action==33))
+            JFPosterTrace([NSString stringWithFormat:
+                @"REMOTE_PROBE origin=%ld action=%ld value=%ld uptime_ms=%lld",
+                (long)origin,(long)action,(long)value,
+                (long long)([NSProcessInfo processInfo].systemUptime*1000.0)]);
+        JFTraceSourceTime(event,origin,action);
+    }
+    // Never apply an input Select from the previous model page to a new page.
+    // In particular, the first phone Select after Libraries -> Media is not a
+    // reliable deliberate click: 12H1006 delivers it before a swipe burst, even
+    // after the old 350ms timer has already fired. Treat that *one* Select as
+    // untrusted until we see a fresh direction gesture or another explicit tap.
+    if (decoded && (origin==1 || origin==3)) {
+        JFMobileGestureState *state=JFMobileState(self);
+        JFUIController *ui=(JFUIController *)objc_getAssociatedObject(self,&menuKey);
+        NSInteger page=ui ? [ui phoneRemotePage] : -1;
+        if (!state->pageKnown || page!=state->seenPage) {
+            NSInteger previous=state->pageKnown ? state->seenPage : -1;
+            if (state->selectPending) {
+                [state cancelPendingSelect];
+                JFPosterTrace(@"PHONE_SELECT_DROPPED_PAGE_TRANSITION");
+            }
+            state->pageKnown=YES;
+            state->seenPage=page;
+            state->firstPhoneSelectGuard=(page==3 && previous==1 &&
+                state->nativeLibrarySelectArmed);
+            state->nativeLibrarySelectArmed=NO;
+            JFPosterTrace([NSString stringWithFormat:
+                @"REMOTE_PAGE_CHANGED from=%ld to=%ld guard=%d uptime_ms=%lld",
+                (long)previous,(long)page,state->firstPhoneSelectGuard,
+                (long long)([NSProcessInfo processInfo].systemUptime*1000.0)]);
+        }
+        // A native Select on Libraries may leave a delayed origin3 echo on Media.
+        // A pure phone-origin library entry must not disable the first real tap.
+        if (decoded && action==5 &&
+            decoded && value==1 &&
+            origin==1 && page==1)
+            state->nativeLibrarySelectArmed=YES;
+    }
+    // Phone touch DMAP action 32/33/34 = contact tracking; 35..38 = directional
+    // intermediate events; 39..42 are completed directional gestures.
+    // Previously these fell through to native BackRow: its list focus moved,
+    // but our Jellyfin model focus stayed behind. Other apps are never touched.
+    if (decoded && origin==3 &&
+        decoded &&
+        action>=30 && action<=42) {
+        JFMobileGestureState *state=JFMobileState(self);
+        NSTimeInterval now=[NSProcessInfo processInfo].systemUptime;
+        // A new contact proves intent to navigate on this grid.
+        if (state->firstPhoneSelectGuard) {
+            state->firstPhoneSelectGuard=NO;
+            JFPosterTrace(@"PHONE_MEDIA_GUARD_RELEASED_BY_TOUCH");
+        }
+        // Any touch/gesture after a Select is proof the user meant to swipe.
+        if (state->selectPending) {
+            [state cancelPendingSelect];
+            JFPosterTrace(@"PHONE_SELECT_CANCELLED_BY_GESTURE");
+        }
+        if (action==32) { state->touching=YES;state->lastTouchAt=now; }
+        if (action==34) state->touching=NO;
+        NSInteger swipe=JFMobileSwipeButton(action);
+        if (swipe!=JFUnknown && value==1) {
+            BOOL duplicate=(state->lastGestureButton==swipe && now-state->lastGestureAt<0.18) ||
+                           (state->lastNativeButton==swipe &&
+                            now-state->lastNativeAt>=0 && now-state->lastNativeAt<0.45);
+            if (!duplicate) {
+                JFBRMenu *menu=objc_getAssociatedObject(self,&menuKey);
+                if (menu) (void)[menu handleEvent:@{@"button":@(swipe),@"phase":@"press"}];
+                state->lastGestureAt=now;state->lastGestureButton=swipe;
+                JFPosterTrace([NSString stringWithFormat:@"PHONE_GESTURE_NAV action=%ld button=%ld",
+                               (long)action,(long)swipe]);
+            } else JFPosterTrace(@"PHONE_GESTURE_DEDUP");
+        }
+        return YES; // Do not let native list focus drift independently.
+    }
+    // A standalone phone click produces action 5 without necessarily sending
+    // a release. Schedule one Select after a short gesture-identification
+    // window; a following touch begin/move/swipe cancels it.
+    if (decoded && origin==3 &&
+        decoded && action==5 &&
+        decoded) {
+        if (value==1) {
+            JFMobileGestureState *state=JFMobileState(self);
+            if (state->firstPhoneSelectGuard) {
+                state->firstPhoneSelectGuard=NO;
+                JFPosterTrace(@"PHONE_FIRST_MEDIA_SELECT_SUPPRESSED");
+            } else {
+                [state armSelectForController:self];
+                JFPosterTrace(@"PHONE_SELECT_PENDING");
+            }
+        }
+        return YES;
+    }
+    // Native-origin directional events remain authoritative for the physical
+    // remote. Some firmware also emits them as a phone swipe's duplicate.
+    if (decoded && origin==1 &&
+        decoded &&
+        value==1 && (action==3 || action==4 || action==6 || action==7)) {
+        NSInteger b=action==3?JFUp:action==4?JFDown:action==6?JFLeft:JFRight;
+        JFMobileGestureState *state=objc_getAssociatedObject(self,&mobileGestureKey);
+        NSTimeInterval now=[NSProcessInfo processInfo].systemUptime;
+        if (state) {
+            if (state->selectPending) {
+                [state cancelPendingSelect];
+                JFPosterTrace(@"PHONE_SELECT_CANCELLED_BY_DIRECTION");
+            }
+            BOOL duplicate=(state->touching && state->lastGestureButton==b &&
+                            now-state->lastGestureAt>=0 && now-state->lastGestureAt<0.45);
+            if (duplicate) {
+                JFPosterTrace(@"PHONE_NATIVE_DIRECTION_DEDUP");
+                return YES;
+            }
+            // Track an early synthesized directional event while a phone touch
+            // is in flight; its later terminal gesture must not repeat movement.
+            if (state->touching && now-state->lastTouchAt>=0 && now-state->lastTouchAt<1.5) {
+                state->lastNativeAt=now;state->lastNativeButton=b;
+            }
+        }
     }
     // Network DMAP sends synthesized clicks. Route to Jellyfin's model-owned
     // focus and selection; BackRow's native visual focus is not the model index.
-    if (Integer(event,@"originator","I",&origin) && (origin==1 || origin==3) &&
-        Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
+    if (decoded && (origin==1 || origin==3) &&
+        decoded) {
         NSInteger b=0;
         switch(action) { case 1:b=JFMenu;break; case 3:b=JFUp;break;
             case 4:b=JFDown;break; case 5:b=JFSelect;break;
             case 6:b=JFLeft;break; case 7:b=JFRight;break; default:break; }
-        if (action==5 && value==1) {
+        if (origin==1 && action==5 && value==1) {
+            JFMobileGestureState *state=objc_getAssociatedObject(self,&mobileGestureKey);
+            if (state && state->selectPending) [state cancelPendingSelect];
             id list=JFBRObject(self,@"list");
             for (NSString *method in @[@"selection",@"selectedIndex",@"selectedRow"]) {
                 NSMethodSignature *sig=[list methodSignatureForSelector:NSSelectorFromString(method)];
@@ -217,7 +459,13 @@ static BOOL Event(id self,SEL cmd,id event) {
         }
         if (b && (value==1 || (value==2 && (b==JFUp || b==JFDown)))) {
             JFBRMenu *menu=objc_getAssociatedObject(self,&menuKey);
+            NSTimeInterval modelStart=[NSProcessInfo processInfo].systemUptime;
             JFHostEventResult result=menu ? [menu handleEvent:@{@"button":@(b),@"phase":value==2 ? @"repeat" : @"press"}] : JFHostEventUnhandled;
+            NSTimeInterval modelMS=([NSProcessInfo processInfo].systemUptime-modelStart)*1000.0;
+            if(modelMS>30.0)
+                JFPosterTrace([NSString stringWithFormat:
+                    @"REMOTE_MODEL_SLOW origin=%ld action=%ld value=%ld duration_ms=%lld",
+                    (long)origin,(long)action,(long)value,(long long)modelMS]);
             if (result==JFHostEventConsumed) return YES;
             if (result==JFHostEventExitRequested && b==JFMenu) {
                 Method native=class_getInstanceMethod(class_getSuperclass(objc_getClass("JellyfinController")),cmd);
@@ -226,7 +474,7 @@ static BOOL Event(id self,SEL cmd,id event) {
         }
         if (b) return YES;
     }
-    if (Integer(event,@"originator","I",&origin) && (origin==1 || origin==3) && Integer(event,@"remoteAction","i",&action) && Integer(event,@"value","i",&value)) {
+    if (decoded && (origin==1 || origin==3) && decoded) {
         JFRemote *remote=objc_getAssociatedObject(self,&remoteKey);
         if (!remote) { remote=[[[JFRemote alloc] init] autorelease]; objc_setAssociatedObject(self,&remoteKey,remote,OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
         NSDictionary *e=[remote action:action value:value time:[NSProcessInfo processInfo].systemUptime];

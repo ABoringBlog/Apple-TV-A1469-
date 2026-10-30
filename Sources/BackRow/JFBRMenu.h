@@ -14,7 +14,7 @@ BOOL JFBRProtocolMatches(Class cls, NSString *name, NSArray *selectors);
     NSArray *_rows;
     NSString *_title;
     long _selection;
-    BOOL _active, _closed;
+    BOOL _active, _closed, _needsReload;
 }
 - (id)initWithController:(id)controller;
 - (BOOL)canRender;

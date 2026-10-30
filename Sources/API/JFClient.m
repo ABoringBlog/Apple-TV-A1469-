@@ -233,6 +233,70 @@ static NSString *AuthorizationValue(NSString *deviceID, NSString *token) {
     _imageNamespace=[[[NSUUID UUID] UUIDString] copy];
     _token = [token copy]; _userID = [uid copy]; return YES;
 }
+- (NSDictionary *)currentUser:(NSError **)error {
+    if(!_token || !_userID.length) return Fail(error,1004,@"Login required");
+    // Never use a catalog cache for current account metadata: ImageTag must
+    // reflect the current Jellyfin profile after edits on the web.
+    return [self request:@"Users/Me" body:nil error:error];
+}
+- (NSData *)freshCurrentAvatarWithTag:(NSString *)tag width:(NSUInteger)width error:(NSError **)error {
+    if(!_token || !_userID.length) return Fail(error,1004,@"Login required");
+    if(![tag isKindOfClass:[NSString class]] || !tag.length || tag.length>128 ||
+       [tag rangeOfCharacterFromSet:[[NSCharacterSet alphanumericCharacterSet]
+                                    invertedSet]].location!=NSNotFound ||
+       width<64 || width>1024)
+        return Fail(error,1007,@"Invalid avatar version");
+    NSString *path=[NSString stringWithFormat:
+        @"Users/%@/Images/Primary?MaxWidth=%lu&tag=%@",_userID,(unsigned long)width,tag];
+    NSURLRequest *req=[self assetRequest:path];
+    NSData *data=req?[self downloadRequest:req error:error]:nil;
+    if(!data || !JFValidImage(data))return nil;
+    return data;
+}
+- (NSDictionary *)libraryScanTask:(NSError **)error {
+    if (error) *error=nil;
+    if (!_token || !_userID.length) return Fail(error,1004,@"Login required");
+    if (JFWorkCancelled()) return Fail(error,NSURLErrorCancelled,@"Cancelled");
+    // ScheduledTasks is an ARRAY endpoint, unlike the dictionary-only request:body:.
+    NSMutableURLRequest *request=[NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"ScheduledTasks" relativeToURL:_baseURL]
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:_timeout];
+    [request setHTTPShouldHandleCookies:NO];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [request setValue:AuthorizationValue(_deviceID,_token) forHTTPHeaderField:@"Authorization"];
+    NSData *data=[self downloadRequest:request error:error];
+    if (!data) return nil;
+    id tasks=[NSJSONSerialization JSONObjectWithData:data options:0 error:error];
+    if (![tasks isKindOfClass:[NSArray class]]) return Fail(error,1005,@"Expected tasks array");
+    for (id entry in tasks) {
+        if (![entry isKindOfClass:[NSDictionary class]]) continue;
+        NSString *key=[entry[@"Key"] isKindOfClass:[NSString class]]?entry[@"Key"]:@"";
+        NSString *name=[entry[@"Name"] isKindOfClass:[NSString class]]?entry[@"Name"]:@"";
+        BOOL found=[key caseInsensitiveCompare:@"RefreshLibrary"]==NSOrderedSame ||
+                   [name caseInsensitiveCompare:@"Scan Media Library"]==NSOrderedSame ||
+                   [name caseInsensitiveCompare:@"Scan Library"]==NSOrderedSame;
+        if (!found) continue;
+        NSString *state=[entry[@"State"] isKindOfClass:[NSString class]]?entry[@"State"]:@"Unknown";
+        NSNumber *progress=[entry[@"CurrentProgressPercentage"] isKindOfClass:[NSNumber class]]?
+                           entry[@"CurrentProgressPercentage"]:nil;
+        NSDictionary *last=[entry[@"LastExecutionResult"] isKindOfClass:[NSDictionary class]]?
+                             entry[@"LastExecutionResult"]:@{};
+        NSString *lastStatus=[last[@"Status"] isKindOfClass:[NSString class]]?last[@"Status"]:@"";
+        NSString *lastEnd=[last[@"EndTimeUtc"] isKindOfClass:[NSString class]]?last[@"EndTimeUtc"]:@"";
+        return @{@"state":state,@"progress":progress?:[NSNull null],
+                 @"lastStatus":lastStatus,@"lastEnd":lastEnd};
+    }
+    return Fail(error,404,@"Scan Media Library scheduled task not found");
+}
+- (BOOL)requestLibraryScan:(NSError **)error {
+    if (!_token || !_userID.length) {
+        Fail(error,1004,@"Login required");return NO;
+    }
+    // Jellyfin POST /Library/Refresh: 204 response indicates scan accepted,
+    // NOT that the asynchronous server scan has already finished.
+    NSDictionary *result=[self request:@"Library/Refresh" body:@{} error:error];
+    return result!=nil;
+}
 - (NSArray *)libraries:(NSError **)error {
     if (!_token) return Fail(error,1004,@"Login required");
     NSString *uid = [_userID stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet alphanumericCharacterSet]];
@@ -336,6 +400,10 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     return [self playbackInfo:identifier startTicks:ticks mediaSourceID:nil audioIndex:-1 subtitleIndex:index error:error];
 }
 - (NSDictionary *)playbackInfo:(NSString *)identifier startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex error:(NSError **)error {
+    return [self playbackInfo:identifier startTicks:ticks mediaSourceID:source audioIndex:audioIndex subtitleIndex:subtitleIndex fallbackTier:0 error:error];
+}
+- (NSDictionary *)playbackInfo:(NSString *)identifier startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex fallbackTier:(NSUInteger)tier error:(NSError **)error {
+    if (tier>2) return Fail(error,1007,@"Invalid fallback tier");
     if (![self requireID:identifier error:error]) return nil;
     BOOL boundSource=source!=nil, hasAudio=audioIndex>=0, hasSubtitle=subtitleIndex>=0;
     if (audioIndex < -1 || audioIndex>10000 || subtitleIndex < -1 || subtitleIndex>10000 ||
@@ -344,6 +412,14 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
     NSDictionary *body=JFPlaybackBody(ticks,subtitleIndex);
     if (!body) return Fail(error,1007,@"Invalid playback parameters");
     NSMutableDictionary *request=[[body mutableCopy] autorelease]; request[@"UserId"]=_userID;
+    if (tier>0) {
+        request[@"EnableDirectPlay"]=@NO;
+        if (tier==2) {
+            request[@"EnableDirectStream"]=@NO;
+            request[@"AllowVideoStreamCopy"]=@NO;
+            request[@"AllowAudioStreamCopy"]=@NO;
+        }
+    }
 // Fixed global 10 Mbps. Diagnostic exceptions retired.
 
     // Jellyfin applies stream indices against a pinned MediaSourceId.
@@ -409,8 +485,9 @@ static BOOL PlaybackTranscodePathAllowed(NSURL *url, NSURL *baseURL, NSString *i
         @"VideoCodec":videoCopy ? @"copy" : @"h264",@"AudioCodec":audioCopy ? @"copy" : @"aac",@"MaxWidth":@"1920",@"MaxHeight":@"1080",@"MaxFramerate":@"30",
         @"VideoBitrate":@"8000000",@"AudioBitrate":@"192000",@"MaxAudioChannels":@"2",@"Profile":@"high",@"Level":@"40",@"VideoBitDepth":@"8",@"VideoRangeType":@"SDR",
         @"AllowVideoStreamCopy":videoCopy ? @"true" : @"false",@"AllowAudioStreamCopy":audioCopy ? @"true" : @"false",@"RequireAvc":@"true",@"SegmentLength":segmentLength}];
-    if (JFTicks(plan[@"audioStreamIndex"]) && [plan[@"audioStreamIndex"] integerValue]>=0 && [plan[@"audioStreamIndex"] integerValue]<=10000)
-        values[@"AudioStreamIndex"]=[plan[@"audioStreamIndex"] stringValue];
+    NSNumber *transportAudio=plan[@"transportAudioStreamIndex"] ?: plan[@"audioStreamIndex"];
+    if (JFTicks(transportAudio) && [transportAudio integerValue]>=0 && [transportAudio integerValue]<=10000)
+        values[@"AudioStreamIndex"]=[transportAudio stringValue];
     if (JFTicks(plan[@"subtitleStreamIndex"]) && [plan[@"subtitleStreamIndex"] integerValue]>=0 && [plan[@"subtitleStreamIndex"] integerValue]<=10000)
         values[@"SubtitleStreamIndex"]=[plan[@"subtitleStreamIndex"] stringValue];
     for (NSString *key in [[values allKeys] sortedArrayUsingSelector:@selector(compare:)]) [query addObject:[NSURLQueryItem queryItemWithName:key value:values[key]]];

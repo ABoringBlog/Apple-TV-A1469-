@@ -236,6 +236,16 @@ int main(void) { @autoreleasepool {
     CHECK(![[JFPlaybackFixture lastBody][@"AllowAudioStreamCopy"] boolValue]);
     CHECK([[JFPlaybackFixture lastBody][@"AlwaysBurnInSubtitleWhenTranscoding"] boolValue]);
     CHECK(![client playbackInfo:@"movie1" startTicks:100 mediaSourceID:nil audioIndex:-1 subtitleIndex:2 error:&error]);
+    CHECK([client playbackInfo:@"movie1" startTicks:100 mediaSourceID:@"source1" audioIndex:-1 subtitleIndex:-1 fallbackTier:1 error:&error]);
+    CHECK(![[JFPlaybackFixture lastBody][@"EnableDirectPlay"] boolValue]);
+    CHECK([[JFPlaybackFixture lastBody][@"EnableDirectStream"] boolValue]);
+    CHECK([[JFPlaybackFixture lastBody][@"AllowVideoStreamCopy"] boolValue]);
+    CHECK([client playbackInfo:@"movie1" startTicks:100 mediaSourceID:@"source1" audioIndex:-1 subtitleIndex:-1 fallbackTier:2 error:&error]);
+    CHECK(![[JFPlaybackFixture lastBody][@"EnableDirectPlay"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"EnableDirectStream"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"AllowVideoStreamCopy"] boolValue]);
+    CHECK(![[JFPlaybackFixture lastBody][@"AllowAudioStreamCopy"] boolValue]);
+    CHECK(![client playbackInfo:@"movie1" startTicks:100 mediaSourceID:@"source1" audioIndex:-1 subtitleIndex:-1 fallbackTier:3 error:&error]);
     NSURLRequest *direct=[client playbackRequest:plan error:&error]; CHECK(direct!=nil); CHECK([direct.URL.query containsString:@"StartTimeTicks=100"]); CHECK(![direct.URL.absoluteString containsString:@"fixture-token"]); CHECK([[direct valueForHTTPHeaderField:@"Authorization"] containsString:@"Token=\"fixture-token\""] && ![direct valueForHTTPHeaderField:@"X-Emby-Token"]);
     NSURL *origin=[NSURL URLWithString:@"https://media.invalid:443/base/master.m3u8"];
     for (NSString *ref in @[@"media.m3u8",@"../seg.ts",@"/key.bin",@"https://media.invalid/seg.ts",@"//media.invalid:443/seg.ts"])
@@ -335,9 +345,21 @@ int main(void) { @autoreleasepool {
     // Paused playback must retain its presentation and captions.
     [native pause]; [native performSelector:@selector(sampleProgress)];
     CHECK(![foundationEvent isEqual:@"popped"]);
-    // Native player window closes without delivering a WasPopped notification.
+    // Temporary nil/different manager identity must NOT terminate the movie.
+    id fixturePlayer=native.preparedPlayer;
     atvVisiblePlayer=nil; [native performSelector:@selector(sampleProgress)];
-    CHECK([foundationEvent isEqual:@"popped"] && foundationTicks==420000000LL);
+    CHECK(![foundationEvent isEqual:@"popped"] && atvEndPresentationCalls==0);
+    atvVisiblePlayer=[NSObject new]; [native performSelector:@selector(sampleProgress)];
+    CHECK(![foundationEvent isEqual:@"popped"]);
+    [atvVisiblePlayer release]; atvVisiblePlayer=fixturePlayer;
+    [native performSelector:@selector(sampleProgress)];
+    CHECK(![foundationEvent isEqual:@"popped"] && atvRate==0.0);
+    // Genuine persistent native presentation disappearance, even WITHOUT a
+    // WasPopped notification, eventually stops, preserving resume position.
+    atvVisiblePlayer=nil; [native performSelector:@selector(sampleProgress)];
+    CHECK(![foundationEvent isEqual:@"popped"]);
+    CHECK(Wait(^BOOL { return [foundationEvent isEqual:@"popped"]; }));
+    CHECK(foundationTicks==420000000LL);
     [native stop];
     [foundationEvent release]; foundationEvent=nil; foundationTicks=-1;
     [native startRequest:direct positionTicks:100 event:^(NSString *event,long long ticks){ [foundationEvent release]; foundationEvent=[event copy]; foundationTicks=ticks; }];
@@ -476,6 +498,34 @@ int main(void) { @autoreleasepool {
             CHECK([p stop]); CHECK([p.currentState isEqual:@"stopped"]);
         }
         [p close]; [p release]; [w cancelAll]; [w release]; [b release];
+    }
+    // Actual controller/native failure ladder: DP -> video/audio copy-only remux
+    // -> transcode. Archived must NOT change on failure; TV episodes do qualify.
+    for (NSString *mode in @[@"fallback-movie",@"fallback-tv",@"fallback-archived"]) {
+        [JFPlaybackFixture setMode:mode];
+        JFWorker *fw=[JFWorker new]; JFMockPlaybackBackend *fb=[JFMockPlaybackBackend new];
+        JFPlaybackController *fp=[[JFPlaybackController alloc] initWithClient:Client() worker:fw backend:fb];
+        CHECK([fp playItem:@"movie1" startTicks:100]);
+        CHECK(Wait(^BOOL { return fb.starts==1; }));
+        CHECK([fb.lastRequest.URL.absoluteString containsString:@"Static=true"]);
+        [fb emit:@"failure" ticks:100];
+        if ([mode isEqual:@"fallback-archived"]) {
+            CHECK([fp.currentState isEqual:@"failed"]);
+            CHECK(fb.starts==1);
+        } else {
+            CHECK(Wait(^BOOL { return fb.starts==2; }));
+            CHECK([fb.lastRequest.URL.query containsString:@"VideoCodec=copy"]);
+            CHECK([fb.lastRequest.URL.query containsString:@"AudioCodec=copy"]);
+            CHECK([fb.lastRequest.URL.query containsString:@"AllowVideoStreamCopy=true"]);
+            [fb emit:@"failure" ticks:100];
+            CHECK(Wait(^BOOL { return fb.starts==3; }));
+            CHECK([fb.lastRequest.URL.query containsString:@"VideoCodec=h264"]);
+            CHECK([fb.lastRequest.URL.query containsString:@"AudioCodec=aac"]);
+            CHECK([fb.lastRequest.URL.query containsString:@"AllowVideoStreamCopy=false"]);
+            [fb emit:@"failure" ticks:100];
+            CHECK([fp.currentState isEqual:@"failed"] && fb.starts==3);
+        }
+        [fp close];[fp release];[fw cancelAll];[fw release];[fb release];
     }
     [JFPlaybackFixture setMode:@"slow"];
     worker=[JFWorker new]; backend=[JFMockPlaybackBackend new]; controller=[[JFPlaybackController alloc] initWithClient:Client() worker:worker backend:backend];

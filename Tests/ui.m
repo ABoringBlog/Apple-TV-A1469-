@@ -75,6 +75,15 @@ static NSUInteger configurationRequests;
         NSHTTPURLResponse *response=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
         [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
         [self.client URLProtocol:self didLoadData:data]; [self.client URLProtocolDidFinishLoading:self];
+    } else if ([self.request.URL.path isEqual:@"/jellyfin/ScheduledTasks"]) {
+        NSData *data=[NSJSONSerialization dataWithJSONObject:
+            @[@{@"Key":@"RefreshLibrary",@"Name":@"Scan Media Library",
+                @"State":@"Running",@"CurrentProgressPercentage":@38}]
+            options:0 error:NULL];
+        NSHTTPURLResponse *response=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+             statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
+        [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:data];[self.client URLProtocolDidFinishLoading:self];
     } else if (multiLibraries && [self.request.URL.path isEqual:@"/jellyfin/Users/user1/Views"]) {
         NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"Items":@[@{@"Id":@"lib1",@"Name":@"Shows",@"CollectionType":@"tvshows"},@{@"Id":@"lib2",@"Name":@"Movies",@"CollectionType":@"movies"}]} options:0 error:NULL];
         NSHTTPURLResponse *response=[[[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{}] autorelease];
@@ -238,6 +247,13 @@ static int legacyInfoReads, legacyIdentifierReads, legacyClassReads;
 @end
 @implementation UIEvent
 @end
+static NSUInteger countedOrigin, countedAction, countedValue;
+@interface UICountedEvent : UIEvent @end
+@implementation UICountedEvent
+- (unsigned)originator { countedOrigin++; return [super originator]; }
+- (int)remoteAction { countedAction++; return [super remoteAction]; }
+- (int)value { countedValue++; return [super value]; }
+@end
 @interface UIMedia : NSObject <UILifecycle>
 @property(nonatomic, retain) UIList *list;
 @property(nonatomic, retain) UIStack *testStack;
@@ -325,6 +341,18 @@ static BOOL Send(UIMedia *controller, NSInteger action, NSInteger value) {
     return [controller brEventAction:event];
 }
 static void Press(UIMedia *controller, NSInteger action) { CHECK(Send(controller,action,1)); Send(controller,action,0); }
+static BOOL Phone(UIMedia *controller, NSInteger action, NSInteger value) {
+    UIEvent *event=[[[UIEvent alloc] init] autorelease];
+    event.remoteAction=(int)action;event.value=(int)value;event.originator=3;
+    return [controller brEventAction:event];
+}
+static void Swipe(UIMedia *controller, NSInteger intermediate, NSInteger terminal) {
+    CHECK(Phone(controller,32,0));
+    CHECK(Phone(controller,33,0));CHECK(Phone(controller,33,0));
+    CHECK(Phone(controller,intermediate,1));
+    CHECK(Phone(controller,33,0));CHECK(Phone(controller,terminal,1));
+    CHECK(Phone(controller,intermediate,0));CHECK(Phone(controller,34,0));
+}
 int main(int argc, char **argv) { @autoreleasepool {
     NSString *mode=argc>1 ? [NSString stringWithUTF8String:argv[1]] : @"normal";
     configurationSuite=[[NSString stringWithFormat:@"org.jellyfin.atv3.tests.%@",[NSUUID UUID].UUIDString] copy];
@@ -462,6 +490,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     [controller controlWasActivated];
     CHECK(activations==1 && [controller.listTitle isEqual:@"Jellyfin"]);
     CHECK(controller.list.datasource && controller.list.reloads==1);
+    // A phone swipe may contain dozens of DMAP touch-move notifications.
+    // Check that each real event reads ABI-verified fields precisely once,
+    // not 3-5 times through NSInvocation for every touch sample.
+    UICountedEvent *touch=[[UICountedEvent alloc] init];
+    touch.originator=3;touch.remoteAction=33;touch.value=0;
+    for (NSUInteger i=0;i<40;i++) CHECK([controller brEventAction:touch]);
+    CHECK(countedOrigin==40 && countedAction==40 && countedValue==40);
+    [touch release];
     JFBRMenu *menu=[controller.list.datasource retain];
     [menu displayTitle:@"Libraries" rows:@[@{@"title":@"Movies",@"enabled":@YES},@{@"title":@"Empty",@"enabled":@NO}] selection:1];
     CHECK([controller.listTitle isEqual:@"Libraries"] && controller.list.selection==1);
@@ -682,6 +718,19 @@ int main(int argc, char **argv) { @autoreleasepool {
     controller=[[objc_getClass("JellyfinController") alloc] init]; [controller controlWasActivated];
     menu=[controller.list.datasource retain];
     int startPops=pops;
+    // 12H1006 DMAP touch sequences: 38/42 down and 36/40 right.
+    // One swipe => one Jellyfin model move, despite touch move events.
+    int originalNativeEvents=nativeEvents;
+    Swipe(controller,38,42); CHECK(controller.list.selection==1);
+    CHECK(nativeEvents==originalNativeEvents); // Touch must not reach native list.
+    Swipe(controller,37,41); CHECK(controller.list.selection==0);
+    // Completed gesture sometimes follows a synthesized native direction:
+    // that pair must not navigate twice.
+    CHECK(Phone(controller,32,0));
+    CHECK(Send(controller,4,1)); CHECK(controller.list.selection==1);
+    CHECK(Phone(controller,38,1)); CHECK(Phone(controller,42,1)); CHECK(Phone(controller,34,0));
+    CHECK(controller.list.selection==1);
+    Press(controller,3); CHECK(controller.list.selection==0);
     Press(controller,4); CHECK(controller.list.selection==1);
     CHECK(Send(controller,4,1)); CHECK(Send(controller,4,1)); Send(controller,4,0);
     CHECK(controller.list.selection==4); // repeated Down skips disabled Sign in
@@ -692,17 +741,74 @@ int main(int argc, char **argv) { @autoreleasepool {
     Press(controller,1); CHECK(pops==afterEditors); // busy root Menu is consumed
     WaitTitle(controller,@"Libraries");
     CHECK([menu itemCount]==4);
+    // Identical source rows/focus changes must not reinitialize BRList.
+    NSArray *sameRows=[[menu valueForKey:@"_rows"] copy];
+    NSUInteger reloadsBefore=controller.list.reloads;
+    [menu displayTitle:controller.listTitle rows:sameRows selection:controller.list.selection];
+    CHECK(controller.list.reloads==reloadsBefore);
+    [sameRows release];
     // Async selection must stay on the requested library while its rows
     // are disabled for loading; previous code reset it to item 0 (Archived).
-    Press(controller,7);CHECK(controller.list.selection==1);
+    Swipe(controller,36,40); CHECK(controller.list.selection==1);
+    // Repeated terminal signal, or a native-origin echo, must not double-advance.
+    CHECK(Phone(controller,40,1)); CHECK(controller.list.selection==1);
+    CHECK(Send(controller,7,1)); CHECK(controller.list.selection==1);
     CHECK(Send(controller,5,1));CHECK(controller.list.selection==1);
     WaitTitle(controller,@"Media");
+    // Real trace: the origin1 Select entered Library and a delayed origin3
+    // echo must NOT enter the first movie after this page transition.
+    // On real device a phantom phone Select precedes touch32/33/36/40.
+    // It must be cancelled, not open the first movie before navigation.
+    CHECK([menu itemCount]>=3);
+    CHECK(Phone(controller,5,1)); // first phone click on newly loaded grid is untrusted
+    CHECK([[menu titleForRow:0] length]>0);
+    // Real-world lag: touch-start can arrive *after* the old debounce expired.
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.85]];
+    CHECK([controller.listTitle containsString:@"Media"]);
+    CHECK(Phone(controller,32,0));
+    CHECK(Phone(controller,33,0));
+    CHECK(Phone(controller,36,1));
+    CHECK(Phone(controller,40,1));
+    CHECK(Phone(controller,34,0));
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.51]];
+    CHECK([controller.listTitle containsString:@"Media"]); // not Detail
+    CHECK(controller.list.selection==0); // fixture has one media item; right is boundary
+    // A standalone phone Select must still open that media after the delay.
+    CHECK(Phone(controller,5,1));
+    WaitTitle(controller,@"Movie");
+    Press(controller,1);WaitTitle(controller,@"Media");
+    Press(controller,1);WaitTitle(controller,@"Libraries");
+    // When a library was entered only by a standalone origin3 phone tap,
+    // the next intentional phone tap must not be discarded as an echo.
+    CHECK(Phone(controller,5,1));WaitTitle(controller,@"Media");
+    CHECK(Phone(controller,5,1));WaitTitle(controller,@"Movie");
+    Press(controller,1);WaitTitle(controller,@"Media");
+    Press(controller,1);WaitTitle(controller,@"Libraries");
+    // Firmware also produces delayed origin3 Select AFTER origin1 release.
+    // The page-transition guard is associated with the page-changing press,
+    // not with how long the previous button remains physically held.
+    CHECK(Send(controller,5,1));WaitTitle(controller,@"Media");
+    CHECK(Send(controller,5,0)); // original press already released
+    CHECK(Phone(controller,5,1)); // late echo from the previous page
+    [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.85]];
+    CHECK([controller.listTitle containsString:@"Media"]);
     Press(controller,1);WaitTitle(controller,@"Libraries");
     Press(controller,6);CHECK(controller.list.selection==0);
-    // Two-column Libraries: left card -> Refresh, right card -> Sign out.
+    // Test a two-library fixture while production renders four columns.
     Press(controller,7); WaitTitle(controller,@"Libraries"); CHECK(controller.list.selection==1);
     Press(controller,3); CHECK(controller.list.selection==3); // Sign out
     Press(controller,6); CHECK(controller.list.selection==2); // Refresh
+    Press(controller,5); WaitTitle(controller,@"Libraries");
+    NSDate *scanDeadline=[NSDate dateWithTimeIntervalSinceNow:4];
+    while ([menu itemCount]<5 && scanDeadline.timeIntervalSinceNow>0)
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    CHECK([menu itemCount]>=5 &&
+          ([[menu titleForRow:4] containsString:@"Scan requested"] ||
+           [[menu titleForRow:4] containsString:@"Scanning"]));
+    CHECK(controller.list.selection==2); // Refresh keeps focus, never jumps to first library
     Press(controller,7); CHECK(controller.list.selection==3); // Sign out
     Press(controller,4); CHECK(controller.list.selection==1); // Right card
     Press(controller,6); CHECK(controller.list.selection==0); // Shows

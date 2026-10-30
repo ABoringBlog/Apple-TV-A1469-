@@ -16,10 +16,12 @@
     JFArtwork *_artwork;
     NSString *_artworkToken, *_searchQuery, *_lastPresentedPlayerState;
     CGFloat _detailScroll;
-    BOOL _searchActive, _artworkRefreshScheduled;
+    BOOL _searchActive, _artworkRefreshScheduled, _pendingLibraryRefresh;
     NSInteger _page;
     BOOL _allowHTTP, _observing, _passwordEntered, _previewSideInset;
 }
+- (NSInteger)phoneRemotePage;
+- (void)probeLibraryResponsiveness:(NSArray *)probe;
 - (void)synchronizeNativeSelection:(long)row;
 - (BOOL)configurePlaybackBackend:(id<JFPlaybackBackend>)backend;
 @property(nonatomic, readonly) JFPlaybackController *playback;

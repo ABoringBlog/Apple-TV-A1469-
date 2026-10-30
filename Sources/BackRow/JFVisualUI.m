@@ -138,22 +138,19 @@ static void JFDrawHeader(CGContextRef c,JFArtwork *art,NSString *user,
     });
     if(brand)JFImage(c,brand,CGRectMake(22,660,46,46),NO,0);
     else JFText(c,@"◈",28,674,29,0.96);
-    JFText(c,@"jellyfin",78,674,27,0.96);
-    // Jellyfin account has no custom avatar at the moment. Draw a native
-    // profile silhouette instead of showing the account name as a text label.
+    JFText(c,@"OMV",78,674,27,0.96);
+    // Native 180px avatar is composited as a separate circular image layer.
+    // This fallback silhouette stays visible while the authenticated avatar
+    // is being fetched, and whenever Jellyfin has no custom avatar.
     CGRect avatar=CGRectMake(1184,657,51,51);
     JFFill(c,0.03,0.03,0.04,1,CGRectMake(1181,653,58,58));
     CGContextSetRGBFillColor(c,0.04,0.48,0.66,1);
     CGContextFillEllipseInRect(c,avatar);
-    CGImageRef account=[art copyImageForID:@"me" type:@"Avatar" width:84];
-    if(account){JFImage(c,account,avatar,YES,26);CGImageRelease(account);}
-    else {
-        CGContextSaveGState(c);JFRound(c,avatar,26);CGContextClip(c);
-        CGContextSetRGBFillColor(c,1,1,1,0.98);
-        CGContextFillEllipseInRect(c,CGRectMake(1201,684,17,17));
-        CGContextFillEllipseInRect(c,CGRectMake(1191,655,37,26));
-        CGContextRestoreGState(c);
-    }
+    CGContextSaveGState(c);JFRound(c,avatar,26);CGContextClip(c);
+    CGContextSetRGBFillColor(c,1,1,1,0.98);
+    CGContextFillEllipseInRect(c,CGRectMake(1201,684,17,17));
+    CGContextFillEllipseInRect(c,CGRectMake(1191,655,37,26));
+    CGContextRestoreGState(c);
     if(leftAction.length) {
         CGRect left=CGRectMake(806,664,169,40);
         JFBox(c,left,8,leftFocus);JFText(c,leftAction,819,675,18,0.98);
@@ -163,15 +160,15 @@ static void JFDrawHeader(CGContextRef c,JFArtwork *art,NSString *user,
         JFBox(c,right,8,rightFocus);JFText(c,rightAction,1005,675,18,0.98);
     }
 }
-// Libraries are two wide, 16:7-ish cards per row. Keep this one geometry
-// shared by the raster background, native images, and animated focus outline.
-static CGRect JFLibraryCardRect(NSInteger index,NSInteger firstRow) {
-    CGFloat x=110+(index%2)*555;
-    CGFloat top=607-(index/2-firstRow)*285;
-    return CGRectMake(x,top-230,505,230);
-}
-static const NSInteger JFLibraryColumns=2;
+// Four libraries per row. Share one geometry between background, native
+// image layers, and animated focus to keep remote navigation aligned.
+static const NSInteger JFLibraryColumns=4;
 static const NSInteger JFLibraryVisibleRows=2;
+static CGRect JFLibraryCardRect(NSInteger index,NSInteger firstRow) {
+    CGFloat x=78+(index%JFLibraryColumns)*283;
+    CGFloat top=565-(index/JFLibraryColumns-firstRow)*245;
+    return CGRectMake(x,top-140,245,140);
+}
 static void JFDrawLibrary(CGContextRef c,NSDictionary *snapshot,NSArray *rows,long selected,NSInteger firstRow,JFArtwork *art,NSString *user,BOOL tiles) {
     NSArray *libraries=snapshot[@"libraries"];NSInteger count=(NSInteger)libraries.count;
     for(NSInteger i=firstRow*JFLibraryColumns;i<count &&
@@ -184,7 +181,7 @@ static void JFDrawLibrary(CGContextRef c,NSDictionary *snapshot,NSArray *rows,lo
                        ([tags[@"Thumb"] isKindOfClass:[NSString class]]?@"Thumb":@"Primary");
         if(!tiles)JFAsset(c,art,item[@"Id"],type,400,rect,YES,10);
         NSString *name=item[@"Name"];
-        JFText(c,JFClip(name,38),rect.origin.x+5,rect.origin.y-29,22,0.92);
+        JFText(c,JFClip(name,23),rect.origin.x+5,rect.origin.y-29,20,0.92);
     }
     if (!libraries.count)JFText(c,@"No libraries available",76,450,29,0.8);
     JFDrawHeader(c,art,user,@"Refresh",@"Sign out",selected==count,selected==count+1);
@@ -244,7 +241,7 @@ static void JFDrawDetail(CGContextRef c,NSDictionary *snapshot,NSArray *rows,lon
     NSDictionary *detail=snapshot[@"detail"];NSString *ident=detail[@"Id"];
     // Request Logo before the large backdrop so the headline appears early.
     CGImageRef logo=[art copyImageForID:ident type:@"Logo" width:630];
-    CGImageRef backdrop=[art copyImageForID:ident type:@"Backdrop" width:1280];
+    CGImageRef backdrop=[art copyImageForID:ident type:@"Backdrop" width:1920];
     if(backdrop){JFImage(c,backdrop,CGRectMake(0,0,1280,720),YES,0);CGImageRelease(backdrop);}
     JFFill(c,0.015,0.015,0.018,0.70,CGRectMake(0,0,1280,720));
     JFFill(c,0.025,0.025,0.031,0.67,CGRectMake(0,0,1280,416));
@@ -252,7 +249,7 @@ static void JFDrawDetail(CGContextRef c,NSDictionary *snapshot,NSArray *rows,lon
     CGRect posterRect=CGRectMake(43,24,324,466);
     JFBox(c,CGRectInset(posterRect,-2,-2),0,NO);
     if(!nativePoster) {
-        CGImageRef pic=[art copyImageForID:ident type:@"Primary" width:400];
+        CGImageRef pic=[art copyImageForID:ident type:@"Primary" width:800];
         if(!pic)pic=JFDecode(poster);
         if(pic){JFImage(c,pic,posterRect,NO,0);CGImageRelease(pic);}
     }
@@ -303,11 +300,11 @@ static NSData *JFGridScene(NSDictionary *snapshot,NSArray *rows,NSInteger firstR
                            BOOL chromeOnly) {
     NSInteger page=[snapshot[@"page"] integerValue];
     CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    CGContextRef c=CGBitmapContextCreate(NULL,1024,576,8,1024*4,space,
+    CGContextRef c=CGBitmapContextCreate(NULL,1920,1080,8,1920*4,space,
                         kCGImageAlphaPremultipliedLast|kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(space);
     if(!c)return nil;
-    CGContextScaleCTM(c,0.8,0.8);
+    CGContextScaleCTM(c,1.5,1.5);
     JFFill(c,0.055,0.055,0.059,1,CGRectMake(0,0,1280,720));
     if(page==JFLibrariesPage)
         JFDrawLibrary(c,snapshot,rows,-1,firstRow,nil,username,YES);
@@ -322,7 +319,7 @@ static NSData *JFGridScene(NSDictionary *snapshot,NSArray *rows,NSInteger firstR
         (CFMutableDataRef)out,CFSTR("public.jpeg"),1,NULL);
     if(destination) {
         CGImageDestinationAddImage(destination,frame,(CFDictionaryRef)@{
-            (id)kCGImageDestinationLossyCompressionQuality:@0.78});
+            (id)kCGImageDestinationLossyCompressionQuality:@0.90});
         CGImageDestinationFinalize(destination);CFRelease(destination);
     }
     CGImageRelease(frame);
@@ -432,6 +429,36 @@ static void JFSetFloat(id control,NSString *name,float value) {
     return self;
 }
 - (BOOL)usingNativeFocus {return _surface!=nil && _focus!=nil && !_closed;}
+- (BOOL)animateMovieFocusOnlyWithSnapshot:(NSDictionary *)snapshot
+                                   rows:(NSArray *)rows
+                              selection:(long)selection
+                                 search:(BOOL)search {
+    if(_closed || ![NSThread isMainThread] || !_focus || !_surface ||
+       !_tilesReady || search || [snapshot[@"page"] integerValue]!=JFMediaPage ||
+       selection<0 || (NSUInteger)selection>=rows.count ||
+       _lastTilePage!=JFMediaPage || _lastTileRow!=_visibleFirstRow ||
+       _lastTileCount!=rows.count || !_viewScope.length) return NO;
+    NSArray *libraries=snapshot[@"libraries"];
+    NSUInteger libIndex=[snapshot[@"index"] unsignedIntegerValue];
+    NSDictionary *lib=[libraries isKindOfClass:[NSArray class]] &&
+                       libIndex<libraries.count ? libraries[libIndex]:nil;
+    NSString *expected=[NSString stringWithFormat:@"3|%@||0",lib[@"Id"]?:@"none"];
+    if(![_viewScope isEqualToString:expected] ||
+       ![_lastTileScope isEqualToString:expected]) return NO;
+    NSDictionary *row=rows[(NSUInteger)selection];
+    if([row[@"action"] isEqualToString:@"media"]) {
+        NSInteger focused=selection/5;
+        if(focused<_visibleFirstRow || focused>=_visibleFirstRow+2)return NO;
+    }
+    CGRect logical=JFFocusRect(JFMediaPage,rows,snapshot,selection,
+                               _visibleFirstRow,NO,0);
+    CGRect bounds=CGRectZero;
+    if(CGRectIsEmpty(logical) || !JFFrame(_host,&bounds))return NO;
+    [self moveFocusTo:logical bounds:bounds animated:YES];
+    // Existing poster layers and CATextLayers stay put; CoreAnimation handles
+    // interpolation on the compositor. No imageBytesForID or ATVImage decoding.
+    return YES;
+}
 - (void)hide {
     if(_surface)JFSetFrame(_surface,CGRectZero);
     if(_focus) {
@@ -445,6 +472,7 @@ static void JFSetFloat(id control,NSString *name,float value) {
     _loginFocusTransition=YES;
     _focusFrame=CGRectZero; // subsequent login must rebuild focus geometry
     if(_detailPoster)JFSetFrame(_detailPoster,CGRectZero);
+    if(_avatarControl)JFSetFrame(_avatarControl,CGRectZero);
     if(_captionHost)JFSetFrame(_captionHost,CGRectZero);
     [self hideNativeCaptions];
     for(id tile in _tiles)JFSetFrame(tile,CGRectZero);
@@ -454,10 +482,14 @@ static void JFSetFloat(id control,NSString *name,float value) {
 - (void)close {
     if(_closed)return;
     _closed=YES;[self hide];
+    [_chromeLayers release];_chromeLayers=nil;
+    [_chromeActive release];_chromeActive=nil;
     [_surface release];_surface=nil;
     [_focus release];_focus=nil;
     [_detailPoster release];_detailPoster=nil;
     [_detailPosterData release];_detailPosterData=nil;
+    [_avatarControl release];_avatarControl=nil;
+    [_avatarData release];_avatarData=nil;
     if(_focusColor){CGColorRelease(_focusColor);_focusColor=NULL;}
     [_tiles release];_tiles=nil;
     [_tileStamps release];_tileStamps=nil;
@@ -776,11 +808,334 @@ static void JFSetFloat(id control,NSString *name,float value) {
     [CATransaction commit];
     [previous release];[oldIDs release];
 }
+// These primitives replace the previous 1920x1080 JPEG surface.  All UI
+// geometry remains in 1280x720 BackRow coordinates, but text rasterizes using
+// the native display scale.  Only genuine Jellyfin art uses image contents.
+static CGRect JFChromeRect(CGRect r,CGRect bounds) {
+    CGFloat sx=bounds.size.width/1280.,sy=bounds.size.height/720.;
+    return CGRectMake(r.origin.x*sx,r.origin.y*sy,
+                      r.size.width*sx,r.size.height*sy);
+}
+static CGColorRef JFChromeColor(CGFloat r,CGFloat g,CGFloat b,CGFloat alpha) {
+    CGColorSpaceRef sp=CGColorSpaceCreateDeviceRGB();
+    CGFloat values[]={r,g,b,alpha};
+    CGColorRef color=CGColorCreate(sp,values);CGColorSpaceRelease(sp);
+    return color;
+}
+// A fixed compositor stack: asynchronous artwork arrival must NEVER alter
+// the ordering of backgrounds, tint, buttons and labels. Previously the
+// backdrop layer was created on first image arrival, after the overlay/button
+// layers, making a fully opaque backdrop cover the details UI.
+static CGFloat JFChromeLayerZ(NSString *key) {
+    if([key isEqualToString:@"detail-backdrop"])return -100;
+    if([key isEqualToString:@"detail-shade"])return -90;
+    if([key isEqualToString:@"detail-bottom-shade"])return -80;
+    if([key isEqualToString:@"detail-poster-box"])return -70;
+    if([key isEqualToString:@"detail-logo"])return -60;
+    if([key isEqualToString:@"detail-title"])return -50;
+    if([key isEqualToString:@"detail-info-bg"] ||
+       [key hasPrefix:@"detail-action-bg-"])return -40;
+    if([key hasPrefix:@"detail-info-"] ||
+       [key hasPrefix:@"detail-action-label-"])return -30;
+    if([key hasPrefix:@"header-"])return 40;
+    return 0;
+}
+- (CALayer *)chrome:(NSString *)key text:(BOOL)text {
+    if(!_surface || !_chromeLayers || !key.length)return nil;
+    CALayer *layer=_chromeLayers[key];
+    if(!layer) {
+        CALayer *parent=JFBRObject(_surface,@"layer");
+        if(![parent isKindOfClass:[CALayer class]])return nil;
+        layer=text?[CATextLayer layer]:[CALayer layer];
+        layer.contentsScale=1.5; // 1280x720 logical UI -> 1920x1080 display
+        if(text) {
+            CATextLayer *t=(CATextLayer *)layer;
+            t.font=(CFTypeRef)@"STHeitiSC-Medium";
+            t.truncationMode=kCATruncationEnd;
+            t.alignmentMode=kCAAlignmentLeft;
+            t.wrapped=NO;
+        }
+        layer.zPosition=JFChromeLayerZ(key);
+        [parent addSublayer:layer];
+        _chromeLayers[key]=layer;
+    }
+    layer.hidden=NO;
+    [_chromeActive addObject:key];
+    return layer;
+}
+- (void)chromeBox:(NSString *)key rect:(CGRect)r bounds:(CGRect)bounds
+               color:(CGColorRef)color corner:(CGFloat)radius {
+    CALayer *l=[self chrome:key text:NO];if(!l)return;
+    CGRect frame=JFChromeRect(r,bounds);
+    if(!CGRectEqualToRect(l.frame,frame))l.frame=frame;
+    if(!l.backgroundColor || !CGColorEqualToColor(l.backgroundColor,color))
+        l.backgroundColor=color;
+    l.cornerRadius=radius*bounds.size.width/1280.;
+    l.masksToBounds=radius>0;
+}
+- (void)chromeText:(NSString *)key value:(NSString *)value
+              rect:(CGRect)r bounds:(CGRect)bounds
+              size:(CGFloat)size shade:(CGFloat)shade wrap:(BOOL)wrap {
+    if(!value.length)return;
+    CATextLayer *t=(CATextLayer *)[self chrome:key text:YES];if(!t)return;
+    CGRect frame=JFChromeRect(r,bounds);
+    if(![t.string isEqual:value])t.string=value;
+    if(!CGRectEqualToRect(t.frame,frame))t.frame=frame;
+    CGFloat requestedSize=size*bounds.size.height/720.;
+    if(t.fontSize!=requestedSize)t.fontSize=requestedSize;
+    t.wrapped=wrap;
+    t.truncationMode=wrap?kCATruncationNone:kCATruncationEnd;
+    CGColorRef col=JFChromeColor(shade,shade,shade,1);
+    if(!t.foregroundColor || !CGColorEqualToColor(t.foregroundColor,col))
+        t.foregroundColor=col;
+    CGColorRelease(col);
+}
+- (void)chromeArtwork:(NSString *)key identifier:(NSString *)identifier
+                 kind:(NSString *)kind width:(NSUInteger)width
+                 rect:(CGRect)r bounds:(CGRect)bounds
+              artwork:(JFArtwork *)art fill:(BOOL)fill corner:(CGFloat)radius {
+    if(!identifier.length)return;
+    CALayer *layer=[self chrome:key text:NO];
+    if(!layer)return;
+    layer.frame=JFChromeRect(r,bounds);
+    layer.contentsGravity=fill?kCAGravityResizeAspectFill:kCAGravityResizeAspect;
+    layer.masksToBounds=YES;
+    layer.cornerRadius=radius*bounds.size.width/1280.;
+    CGImageRef image=[art copyImageForID:identifier type:kind width:width];
+    if(!image) {
+        // No stale pixels may remain when switching between two details:
+        // clear first, allow the background worker to fill asynchronously.
+        if(layer.contents)layer.contents=nil;
+        return;
+    }
+    if(layer) {
+        layer.frame=JFChromeRect(r,bounds);
+        // Do not re-upload an unchanged cached CGImage to the A5 GPU.
+        if(layer.contents!=(id)image)layer.contents=(id)image;
+        layer.contentsGravity=fill?kCAGravityResizeAspectFill:kCAGravityResizeAspect;
+        layer.masksToBounds=YES;
+        layer.cornerRadius=radius*bounds.size.width/1280.;
+    }
+    CGImageRelease(image);
+}
+- (void)nativeHeaderWithLeft:(NSString *)left right:(NSString *)right
+                    bounds:(CGRect)bounds {
+    CGColorRef bar=JFChromeColor(.075,.075,.082,.98);
+    CGColorRef panel=JFChromeColor(.13,.13,.15,.94);
+    CGColorRef av=JFChromeColor(.04,.48,.66,1);
+    [self chromeBox:@"header-bg" rect:CGRectMake(0,651,1280,69)
+             bounds:bounds color:bar corner:0];
+    static CGImageRef icon=NULL;static dispatch_once_t once;
+    dispatch_once(&once,^{
+        NSBundle *bundle=[NSBundle bundleWithIdentifier:@"org.jellyfin.atv3"];
+        NSString *name=[bundle pathForResource:@"AppIcon" ofType:@"png"];
+        if(!name.length)name=@"/Applications/Jellyfin.frappliance/AppIcon.png";
+        icon=JFDecode([NSData dataWithContentsOfFile:name]);
+    });
+    if(icon) {
+        CALayer *logo=[self chrome:@"header-app-icon" text:NO];
+        logo.frame=JFChromeRect(CGRectMake(22,660,46,46),bounds);
+        if(logo.contents!=(id)icon)logo.contents=(id)icon;
+        logo.contentsGravity=kCAGravityResizeAspect;
+    }
+    [self chromeText:@"header-omv" value:@"OMV"
+                rect:CGRectMake(78,671,172,39) bounds:bounds size:27 shade:.96 wrap:NO];
+    [self chromeBox:@"header-avatar-base" rect:CGRectMake(1184,657,51,51)
+             bounds:bounds color:av corner:25.5];
+    if(left.length) {
+        [self chromeBox:@"header-left-bg" rect:CGRectMake(806,664,169,40)
+                 bounds:bounds color:panel corner:8];
+        [self chromeText:@"header-left-label" value:left
+                    rect:CGRectMake(819,673,150,29) bounds:bounds size:18 shade:.98 wrap:NO];
+    }
+    if(right.length) {
+        [self chromeBox:@"header-right-bg" rect:CGRectMake(991,664,170,40)
+                 bounds:bounds color:panel corner:8];
+        [self chromeText:@"header-right-label" value:right
+                    rect:CGRectMake(1005,673,152,29) bounds:bounds size:18 shade:.98 wrap:NO];
+    }
+    CGColorRelease(bar);CGColorRelease(panel);CGColorRelease(av);
+}
+- (void)updateNativeChrome:(NSDictionary *)snapshot rows:(NSArray *)rows
+                    artwork:(JFArtwork *)art bounds:(CGRect)bounds
+                     search:(BOOL)search query:(NSString *)query
+                     scroll:(CGFloat)scroll {
+    if(!_surface)return;
+    if(!_chromeLayers)_chromeLayers=[NSMutableDictionary new];
+    if(!_chromeActive)_chromeActive=[NSMutableSet new];
+    [_chromeActive removeAllObjects];
+    NSInteger page=[snapshot[@"page"] integerValue];
+    CGColorRef background=JFChromeColor(.055,.055,.059,1);
+    CALayer *root=JFBRObject(_surface,@"layer");
+    if([root isKindOfClass:[CALayer class]]) {
+        root.backgroundColor=background;
+        root.masksToBounds=YES;
+    }
+    CGColorRelease(background);
+    CGColorRef panel=JFChromeColor(.13,.13,.15,.94);
+    CGColorRef overlay=JFChromeColor(.015,.015,.018,.70);
+    CGColorRef dim=JFChromeColor(.025,.025,.031,.67);
+    [CATransaction begin];[CATransaction setDisableActions:YES];
+    if(page==JFLibrariesPage) {
+        NSArray *libraries=snapshot[@"libraries"];
+        NSUInteger count=libraries.count;
+        for(NSInteger i=_visibleFirstRow*JFLibraryColumns;
+            i<(NSInteger)count && i<(_visibleFirstRow+JFLibraryVisibleRows)*JFLibraryColumns;i++){
+            NSDictionary *v=libraries[(NSUInteger)i];
+            CGRect r=JFLibraryCardRect(i,_visibleFirstRow);
+            [self chromeBox:[NSString stringWithFormat:@"lib-box-%ld",(long)i%8]
+                       rect:CGRectInset(r,-3,-3) bounds:bounds color:panel corner:13];
+            [self chromeText:[NSString stringWithFormat:@"lib-label-%ld",(long)i%8]
+                      value:JFClip(v[@"Name"],23)
+                       rect:CGRectMake(r.origin.x+5,r.origin.y-34,r.size.width-10,31)
+                     bounds:bounds size:20 shade:.92 wrap:NO];
+        }
+        if(!count)[self chromeText:@"lib-empty" value:@"No libraries available"
+                              rect:CGRectMake(76,440,950,43)
+                            bounds:bounds size:29 shade:.8 wrap:NO];
+        [self nativeHeaderWithLeft:@"Refresh" right:@"Sign out" bounds:bounds];
+        // The native layer UI previously hid _message rows, making Refresh
+        // appear inert even if the async request was submitted or rejected.
+        for (NSDictionary *row in rows) {
+            if (![row[@"action"] isEqual:@"none"]) continue;
+            NSString *status=row[@"title"];
+            if (![status isKindOfClass:[NSString class]] || !status.length) continue;
+            [self chromeText:@"library-refresh-status" value:status
+                        rect:CGRectMake(730,611,510,34)
+                      bounds:bounds size:17 shade:.95 wrap:NO];
+        }
+    } else if(page==JFDetailPage) {
+        NSDictionary *detail=snapshot[@"detail"];
+        NSString *ident=detail[@"Id"];
+        [self chromeArtwork:@"detail-backdrop" identifier:ident kind:@"Backdrop"
+                       width:1920 rect:CGRectMake(0,0,1280,720)
+                      bounds:bounds artwork:art fill:YES corner:0];
+        [self chromeBox:@"detail-shade" rect:CGRectMake(0,0,1280,720)
+                  bounds:bounds color:overlay corner:0];
+        [self chromeBox:@"detail-bottom-shade" rect:CGRectMake(0,0,1280,416)
+                  bounds:bounds color:dim corner:0];
+        [self chromeBox:@"detail-poster-box" rect:CGRectMake(41,22,328,470)
+                  bounds:bounds color:panel corner:0];
+        [self chromeArtwork:@"detail-logo" identifier:ident kind:@"Logo"
+                       width:900 rect:CGRectMake(492,531+scroll,658,157)
+                      bounds:bounds artwork:art fill:NO corner:0];
+        [self chromeText:@"detail-title" value:JFClip(detail[@"Name"],42)
+                    rect:CGRectMake(432,492+scroll,771,39)
+                  bounds:bounds size:27 shade:1 wrap:NO];
+        const CGFloat left=430, pane=784, gap=12;
+        NSInteger button=0;CGFloat nextTop=405;
+        NSString *facts=JFDetailFacts(detail)?:@"",*genres=JFDetailGenres(detail)?:@"";
+        NSString *overview=[detail[@"Overview"] isKindOfClass:[NSString class]]?detail[@"Overview"]:@"";
+        NSString *desc=overview.length?overview:@"No description available";
+        for(NSUInteger i=0;i<rows.count;i++) {
+            NSDictionary *row=rows[i];
+            NSString *action=row[@"action"];CGRect rect=CGRectZero;
+            if(button<3){
+                CGFloat w=(pane-2*gap)/3.;
+                rect=CGRectMake(left+button*(w+gap),420,w,58);button++;
+            }else if([action isEqual:@"subtitle"]||[action isEqual:@"audio"]){
+                rect=CGRectMake(left,nextTop-58,pane,58);
+                nextTop=rect.origin.y-15;
+            }else if([action isEqual:@"info"]){
+                CGFloat h=MAX(158,108+JFDescriptionHeight(desc,pane-40,20)+22);
+                rect=CGRectMake(left,nextTop-h,pane,h);
+                CGRect sr=CGRectOffset(rect,0,scroll);
+                [self chromeBox:@"detail-info-bg" rect:sr bounds:bounds color:panel corner:9];
+                [self chromeText:@"detail-info-facts" value:JFClip(facts,75)
+                            rect:CGRectMake(left+21,nextTop-42+scroll,pane-42,28)
+                          bounds:bounds size:19 shade:.98 wrap:NO];
+                [self chromeText:@"detail-info-genres" value:JFClip(genres,73)
+                            rect:CGRectMake(left+21,nextTop-77+scroll,pane-42,27)
+                          bounds:bounds size:18 shade:.77 wrap:NO];
+                [self chromeText:@"detail-info-description" value:desc
+                            rect:CGRectMake(left+21,sr.origin.y+19,pane-42,h-115)
+                          bounds:bounds size:20 shade:.84 wrap:YES];
+                continue;
+            }else continue;
+            rect=CGRectOffset(rect,0,scroll);
+            [self chromeBox:[NSString stringWithFormat:@"detail-action-bg-%lu",(unsigned long)i]
+                       rect:rect bounds:bounds color:panel corner:9];
+            [self chromeText:[NSString stringWithFormat:@"detail-action-label-%lu",(unsigned long)i]
+                      value:JFClip(row[@"title"],([action isEqual:@"subtitle"] ||
+                            [action isEqual:@"audio"])?64:19)
+                       rect:CGRectMake(rect.origin.x+18,rect.origin.y+16,rect.size.width-32,31)
+                     bounds:bounds size:20 shade:1 wrap:NO];
+        }
+    }else{
+        NSInteger count=0;
+        for(NSDictionary *row in rows)
+            if([row[@"action"] isEqual:@"media"])count++;
+        if(search) {
+            CGColorRef dark=JFChromeColor(.03,.03,.035,.94);
+            [self chromeBox:@"search-shade" rect:CGRectMake(0,0,1280,649)
+                     bounds:bounds color:dark corner:0];
+            [self chromeBox:@"search-entry-bg" rect:CGRectMake(104,558,1069,65)
+                     bounds:bounds color:panel corner:10];
+            [self chromeText:@"search-query" value:query.length?JFClip(query,65):
+                                      @"Select here to search this library"
+                        rect:CGRectMake(126,575,1024,36)
+                      bounds:bounds size:25 shade:.98 wrap:NO];
+            [self chromeText:@"search-count"
+                      value:[NSString stringWithFormat:@"Search results: %ld",(long)count]
+                        rect:CGRectMake(106,514,600,32)
+                      bounds:bounds size:21 shade:.78 wrap:NO];
+            CGColorRelease(dark);
+        }
+        if(!count)[self chromeText:@"media-empty"
+                           value:search?@"No results":@"This library is empty"
+                            rect:CGRectMake(110,399,970,38)
+                          bounds:bounds size:26 shade:.76 wrap:NO];
+        [self nativeHeaderWithLeft:@"Back" right:search?@"Close":@"Search"
+                            bounds:bounds];
+    }
+    // Hide layers not used by this page; keep them allocated for later reuse.
+    for(NSString *key in _chromeLayers) {
+        CALayer *layer=_chromeLayers[key];
+        if(![_chromeActive containsObject:key])layer.hidden=YES;
+    }
+    [CATransaction commit];
+    CGColorRelease(panel);CGColorRelease(overlay);CGColorRelease(dim);
+}
+- (void)updateNativeAvatar:(JFArtwork *)art bounds:(CGRect)bounds {
+    if(!_avatarControl) {
+        id pic=JFBRNew(NSClassFromString(@"BRImageControl"));
+        if(!pic || !JFBRHas(pic,@"setImage:",@encode(void),@[@"@"]) ||
+           !JFSetFrame(pic,CGRectZero) ||
+           !JFBRCall(_host,@"addSubview:",@[pic])) {[pic release];return;}
+        _avatarControl=pic;
+        CALayer *layer=JFBRObject(pic,@"layer");
+        if([layer isKindOfClass:[CALayer class]]) {
+            layer.masksToBounds=YES;
+            layer.contentsGravity=kCAGravityResizeAspectFill;
+        }
+    }
+    // The screen UI uses 1280x720 logical coordinates. BRControl scales to
+    // physical 1920x1080, while the avatar itself is decoded at 180px.
+    CGRect frame=CGRectMake(bounds.origin.x+1184*bounds.size.width/1280.,
+        bounds.origin.y+657*bounds.size.height/720.,
+        51*bounds.size.width/1280.,51*bounds.size.height/720.);
+    JFSetFrame(_avatarControl,frame);
+    CALayer *layer=JFBRObject(_avatarControl,@"layer");
+    if([layer isKindOfClass:[CALayer class]])layer.cornerRadius=frame.size.width/2.;
+    NSData *data=[art imageBytesForID:@"me" type:@"Avatar" width:180];
+    if([_avatarData isEqualToData:data])return;
+    id image=data?JFBRObjectWithObject(NSClassFromString(@"ATVImage"),
+                                       @"imageWithData:",data):nil;
+    if(data && !image)return;
+    JFBRCall(_avatarControl,@"setImage:",@[image?:[NSNull null]]);
+    [_avatarData release];_avatarData=[data copy];
+    if(layer && data.length) {
+        [layer removeAnimationForKey:@"JFAvatarRefresh"];
+        CABasicAnimation *fade=[CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue=@0.0;fade.toValue=@1.0;fade.duration=0.22;
+        [layer addAnimation:fade forKey:@"JFAvatarRefresh"];
+    }
+}
 - (void)updateDetailPoster:(NSDictionary *)snapshot artwork:(JFArtwork *)art
                          fallback:(NSData *)fallback bounds:(CGRect)bounds {
     if(!_detailPoster)return;
     NSString *identifier=snapshot[@"detail"][@"Id"];
-    NSData *bytes=[art imageBytesForID:identifier type:@"Primary" width:400];
+    NSData *bytes=[art imageBytesForID:identifier type:@"Primary" width:800];
     if(!bytes.length && [fallback isKindOfClass:[NSData class]])bytes=fallback;
     if(!bytes.length) {
         [_detailPosterData release];_detailPosterData=nil;
@@ -923,26 +1278,43 @@ static void JFSetFloat(id control,NSString *name,float value) {
             layer.cornerRadius=page==JFLibrariesPage?10.0:0.0;
             layer.contentsGravity=kCAGravityResizeAspectFill;
         }
-        NSData *data=[art imageBytesForID:identifier type:type width:400];
-        NSString *stamp=[NSString stringWithFormat:@"%@/%@/%d",identifier,type,data!=nil];
+        // Movie posters arrive as CGImages predecoded on JFArtwork's
+        // dedicated worker. Transfer them directly to CALayer.contents:
+        // no ATVImage imageWithData: (JPEG re-decode) on the UI thread.
+        BOOL nativeBitmap=(page==JFMediaPage && [layer isKindOfClass:[CALayer class]]);
+        CGImageRef readyPixels=nativeBitmap?
+            [art copyImageForID:identifier type:type width:400]:NULL;
+        NSData *data=nativeBitmap?nil:[art imageBytesForID:identifier type:type
+                                  width:page==JFLibrariesPage?900:400];
+        BOOL pixelsReady=nativeBitmap?(readyPixels!=NULL):(data!=nil);
+        NSString *stamp=[NSString stringWithFormat:@"%@/%@/%d",
+                          identifier,type,pixelsReady];
         if(![_tileStamps[(NSUInteger)i] isEqual:stamp]) {
-            // Reused BackRow tile may still show ANOTHER movie. Clear the old
-            // pixels before postponing a costly imageWithData conversion.
-            BOOL reused= ![_tileStamps[(NSUInteger)i] hasPrefix:
+            BOOL reused=![_tileStamps[(NSUInteger)i] hasPrefix:
                 [NSString stringWithFormat:@"%@/%@/",identifier,type]];
             if(reused) {
                 JFBRCall(tile,@"setImage:",@[[NSNull null]]);
+                if(nativeBitmap)layer.contents=nil;
                 _tileStamps[(NSUInteger)i]=@"";
             }
-            if(data && changedImages>=2)deferredImages=YES;
+            // Limit image uploads to two per render frame, even if all ten
+            // movie covers were decoded by the worker at the same moment.
+            if(pixelsReady && changedImages>=2)deferredImages=YES;
             else {
-                id image=data?JFBRObjectWithObject(NSClassFromString(@"ATVImage"),@"imageWithData:",data):nil;
-                JFBRCall(tile,@"setImage:",@[image?:[NSNull null]]);
+                BOOL applied=NO;
+                if(nativeBitmap) {
+                    if(layer.contents!=(id)readyPixels)layer.contents=(id)readyPixels;
+                    applied=readyPixels!=NULL;
+                } else {
+                    id image=data?JFBRObjectWithObject(NSClassFromString(@"ATVImage"),
+                                                        @"imageWithData:",data):nil;
+                    JFBRCall(tile,@"setImage:",@[image?:[NSNull null]]);
+                    applied=image!=nil;
+                }
                 _tileStamps[(NSUInteger)i]=stamp;
-                if(data && image) {
+                if(pixelsReady && applied) {
                     changedImages++;
-                    // Fade in ONLY when pixels arrive or this tile first
-                    // adopts a new movie. No timer and no full-frame redraw.
+                    // CoreAnimation handles fading without re-rendering pixels.
                     CALayer *posterLayer=JFBRObject(tile,@"layer");
                     if([posterLayer isKindOfClass:[CALayer class]]) {
                         [posterLayer removeAnimationForKey:@"JFPosterAppear"];
@@ -956,6 +1328,7 @@ static void JFSetFloat(id control,NSString *name,float value) {
                 }
             }
         }
+        if(readyPixels)CGImageRelease(readyPixels);
         CGRect view=CGRectMake(bounds.origin.x+frame.origin.x*bounds.size.width/1280.,
             bounds.origin.y+frame.origin.y*bounds.size.height/720.,
             frame.size.width*bounds.size.width/1280.,
@@ -1040,18 +1413,31 @@ static void JFSetFloat(id control,NSString *name,float value) {
     if(CGRectEqualToRect(frame,_focusFrame))return;
     CGRect old=_focusFrame;
     _focusFrame=frame;
-    // The BackRow BRControl owns a real CALayer. Move a single thin outline
-    // through CoreAnimation rather than encoding a JPEG for each keypress.
+    // BRControl itself need not implement addAnimation:forKey:. Its actual
+    // backing CALayer does; animate that layer, never repaint the poster.
+    CALayer *focusLayer=JFBRObject(_focus,@"layer");
+    BOOL hasFocusLayer=[focusLayer isKindOfClass:[CALayer class]];
+    CGPoint start=hasFocusLayer?
+        ((CALayer *)[focusLayer presentationLayer]?:focusLayer).position:CGPointZero;
+    // Prevent an implicit frame animation competing with our short focus slide.
+    if(hasFocusLayer) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+    }
     JFSetFrame(_focus,frame);
-    if(animated && !CGRectIsEmpty(old) && JFBRHas(_focus,@"addAnimation:forKey:",@encode(void),@[@"@",@"@"])) {
+    CGPoint finish=hasFocusLayer?focusLayer.position:CGPointZero;
+    if(hasFocusLayer)[CATransaction commit];
+    if(animated && !CGRectIsEmpty(old) && hasFocusLayer &&
+       isfinite(start.x) && isfinite(start.y) &&
+       isfinite(finish.x) && isfinite(finish.y) &&
+       hypot(finish.x-start.x,finish.y-start.y)>0.5) {
         CABasicAnimation *animation=[CABasicAnimation animationWithKeyPath:@"position"];
-        CGPoint start=CGPointMake(CGRectGetMidX(old),CGRectGetMidY(old));
-        CGPoint finish=CGPointMake(CGRectGetMidX(frame),CGRectGetMidY(frame));
         animation.fromValue=[NSValue valueWithBytes:&start objCType:@encode(CGPoint)];
         animation.toValue=[NSValue valueWithBytes:&finish objCType:@encode(CGPoint)];
         animation.duration=0.105;
         animation.timingFunction=[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        JFBRCall(_focus,@"addAnimation:forKey:",@[animation,@"JellyfinFocusSlide"]);
+        [focusLayer removeAnimationForKey:@"JellyfinFocusSlide"];
+        [focusLayer addAnimation:animation forKey:@"JellyfinFocusSlide"];
     }
 }
 - (void)renderSnapshot:(NSDictionary *)snapshot rows:(NSArray *)rows selection:(long)selection
@@ -1059,7 +1445,7 @@ static void JFSetFloat(id control,NSString *name,float value) {
                 search:(BOOL)search query:(NSString *)query scroll:(CGFloat)scroll {
     if(_closed||!_host||![NSThread isMainThread])return;
     NSInteger page=[snapshot[@"page"] integerValue];
-    if(page==JFLoginPage || page==JFLibraryPage){[self hide];return;}
+    if(page==JFLoginPage || page==JFLibraryPage){_cachedStaticMediaChromeValid=NO;[self hide];return;}
     if(!_surface) {
         id surface=JFBRNew(NSClassFromString(@"BRImageControl"));
         CGRect bounds=CGRectZero;
@@ -1069,6 +1455,12 @@ static void JFSetFloat(id control,NSString *name,float value) {
         JFBRCall(_host,@"addSubview:",@[surface]);_surface=surface;
     }
     CGRect bounds=CGRectZero;if(!JFFrame(_host,&bounds))return;JFSetFrame(_surface,bounds);
+    if(!_nativeChromeInitialized) {
+        // The image control is only a compositor host. No framebuffer JPEG.
+        JFBRCall(_surface,@"setImage:",@[[NSNull null]]);
+        _nativeChromeInitialized=YES;
+        JFPosterTrace(@"NATIVE_CHROME_NO_JPEG_ACTIVE");
+    }
     if(!_tiles && (page==JFLibrariesPage || page==JFMediaPage ||
                     page==JFSeasonsPage || page==JFEpisodesPage)) {
         NSMutableArray *views=[NSMutableArray array],*stamps=[NSMutableArray array];
@@ -1108,6 +1500,7 @@ static void JFSetFloat(id control,NSString *name,float value) {
             JFPosterTrace(@"UI_NATIVE_FOCUS_LAYER_READY");
         } else [ctrl release];
     }
+    [self updateNativeAvatar:artwork bounds:bounds];
     if(page==JFDetailPage) {
         if(!_detailPoster) {
             id pic=JFBRNew(NSClassFromString(@"BRImageControl"));
@@ -1229,70 +1622,35 @@ static void JFSetFloat(id control,NSString *name,float value) {
     }
     [self updateNativeCaptions:rows scope:scope search:search page:page bounds:bounds];
     [CATransaction commit];
-    // Ordinary D-pad movement only updates the focus CALayer.
-    // Selection itself is never part of the expensive scene identity.
-    NSMutableString *visibleLabels=[NSMutableString string];
-    if(page==JFDetailPage) {
-        for(NSDictionary *r in rows)[visibleLabels appendFormat:@"%@,",r[@"title"]?:@""];
-    } else if(page==JFLibrariesPage) {
-        NSArray *all=snapshot[@"libraries"];
-        for(NSInteger i=_visibleFirstRow*JFLibraryColumns;i<(NSInteger)all.count &&
-            i<(_visibleFirstRow+JFLibraryVisibleRows)*JFLibraryColumns;i++)
-            [visibleLabels appendFormat:@"%@,",all[(NSUInteger)i][@"Name"]?:@""];
-    } else {
-        NSInteger first=_visibleFirstRow*5;
-        NSInteger limit=MIN(mediaCount,first+(search?5:10));
-        for(NSInteger i=first;i<limit;i++) {
-            NSInteger idx=i+(search?1:0);
-            NSDictionary *r=rows[(NSUInteger)idx];
-            [visibleLabels appendFormat:@"%@:%@,",r[@"name"]?:r[@"title"]?:@"",r[@"year"]?:@""];
-        }
+    // Static media chrome does not depend on the focused movie. A D-pad move
+    // must not rebuild every background/header/search CALayer on the A5 CPU.
+    // Still update captions, poster tiles and the focused outline above.
+    BOOL staticMedia=(page==JFMediaPage && !search);
+    BOOL reuseChrome=staticMedia && _cachedStaticMediaChromeValid &&
+        _cachedStaticMediaChromeRowCount==rows.count &&
+        CGRectEqualToRect(_cachedStaticMediaChromeBounds,bounds) &&
+        [_cachedStaticMediaChromeScope isEqualToString:scope];
+    NSTimeInterval chromeStart=[NSProcessInfo processInfo].systemUptime;
+    if(!reuseChrome) {
+        [self updateNativeChrome:snapshot rows:rows artwork:artwork
+                         bounds:bounds search:search query:query scroll:scroll];
+        [_cachedStaticMediaChromeScope release];
+        _cachedStaticMediaChromeScope=staticMedia?[scope copy]:nil;
+        _cachedStaticMediaChromeRowCount=staticMedia?rows.count:0;
+        _cachedStaticMediaChromeBounds=bounds;
+        _cachedStaticMediaChromeValid=staticMedia;
     }
-    NSString *renderKey=[NSString stringWithFormat:@"%@|%ld|%lu|%ld|%@|%@|%@|%ld|%ld",
-       scope,(long)_visibleFirstRow,(unsigned long)(_tilesReady && page!=JFDetailPage?0:artwork.artworkVersion),
-       (long)mediaCount,rows.count?rows[0][@"title"]:@"",
-       query?:@"",visibleLabels,(long)(scroll*2),(long)poster.length];
-    if(!_focus)renderKey=[renderKey stringByAppendingFormat:@"|focus=%ld",(long)selection];
-    [self moveFocusTo:focus bounds:bounds animated:!CGRectIsEmpty(_focusFrame)];
-    if(page==JFMediaPage && !search && _nativeCaptionReady && _tilesReady && _focus)
-        renderKey=[NSString stringWithFormat:@"CHROME|%d",(mediaCount>0)];
-    else if(page!=JFDetailPage && _tilesReady && _focus)
-        renderKey=JFGridKey(snapshot,rows,scope,_visibleFirstRow,search,query);
-    if([_lastDrawKey isEqual:renderKey])return;
-    if(page!=JFDetailPage && _tilesReady && _focus) {
-        [self requestGridScene:snapshot rows:rows key:renderKey
-                      firstRow:_visibleFirstRow search:search
-                         query:query username:username];
-        if(![renderKey hasPrefix:@"CHROME|"])
-            [self idlePrebuildNeighbor:snapshot rows:rows key:renderKey scope:scope
-                                search:search query:query username:username];
-        return;
-    }
-    [_lastDrawKey release];_lastDrawKey=[renderKey copy];
-    CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
-    // Grid screenshots use a smaller raster to improve A5 response time;
-    // detail text and imagery remain full 720p.
-    size_t width=page==JFDetailPage?1280:1024;
-    size_t height=page==JFDetailPage?720:576;
-    CGContextRef c=CGBitmapContextCreate(NULL,width,height,8,width*4,space,
-                kCGImageAlphaPremultipliedLast|kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(space);if(!c)return;
-    CGContextScaleCTM(c,(CGFloat)width/1280.0,(CGFloat)height/720.0);
-    JFFill(c,0.055,0.055,0.059,1,CGRectMake(0,0,1280,720));
-    long nativeSelection=_focus?-1:selection;
-    if(page==JFLibrariesPage)JFDrawLibrary(c,snapshot,rows,nativeSelection,_visibleFirstRow,artwork,username,_tilesReady);
-    else if(page==JFDetailPage)JFDrawDetail(c,snapshot,rows,nativeSelection,artwork,poster,scroll,_detailPoster!=nil);
-    else JFDrawMedia(c,snapshot,rows,nativeSelection,_visibleFirstRow,artwork,username,
-                      search,query,_tilesReady,NO);
-    CGImageRef pixels=CGBitmapContextCreateImage(c);CGContextRelease(c);if(!pixels)return;
-    NSMutableData *out=[NSMutableData data];
-    CGImageDestinationRef dest=CGImageDestinationCreateWithData((CFMutableDataRef)out,CFSTR("public.jpeg"),1,NULL);
-    if(dest){CGImageDestinationAddImage(dest,pixels,(CFDictionaryRef)@{(id)kCGImageDestinationLossyCompressionQuality:@0.79});
-        CGImageDestinationFinalize(dest);CFRelease(dest);}
-    CGImageRelease(pixels);
-    id image=JFBRObjectWithObject(NSClassFromString(@"ATVImage"),@"imageWithData:",out);
-    if(image)JFBRCall(_surface,@"setImage:",@[image]);
-    [self moveFocusTo:focus bounds:bounds animated:!CGRectIsEmpty(_focusFrame)];
+    NSTimeInterval chromeDuration=[NSProcessInfo processInfo].systemUptime-chromeStart;
+    if(chromeDuration>0.075)
+        JFPosterTrace([NSString stringWithFormat:
+            @"PERF_CHROME_SLOW page=%ld duration_ms=%lld reused=%d",
+            (long)page,(long long)(chromeDuration*1000.0),reuseChrome]);
+    if(_focus) [self moveFocusTo:focus bounds:bounds animated:!CGRectIsEmpty(_focusFrame)];
+    // Focus-only changes can safely reuse static chrome until the page,
+    // media count, layout, or search state changes.
 }
-- (void)dealloc {[self close];[super dealloc];}
+- (void)dealloc {
+    [_cachedStaticMediaChromeScope release];
+    [self close];[super dealloc];
+}
 @end

@@ -15,6 +15,10 @@
 - (NSDictionary *)serverInfo:(NSError **)error;
 - (BOOL)login:(NSString *)username password:(NSString *)password error:(NSError **)error;
 - (NSArray *)libraries:(NSError **)error;
+// Start an authenticated full library scan on explicit user action (admin-only).
+- (BOOL)requestLibraryScan:(NSError **)error;
+// Read-only authorized ScheduledTasks query. Returns filtered scan state, never credentials.
+- (NSDictionary *)libraryScanTask:(NSError **)error;
 // All IDs are server identifiers (ASCII alphanumeric, '-' or '_'), never paths.
 - (NSArray *)itemsInLibrary:(NSString *)parent type:(NSString *)type start:(NSUInteger)start limit:(NSUInteger)limit error:(NSError **)error;
 - (NSArray *)seasons:(NSString *)series error:(NSError **)error;
@@ -25,6 +29,10 @@
 // Independent playback API. Requests carry authentication headers, never log them.
 - (NSDictionary *)playbackInfo:(NSString *)identifier startTicks:(long long)ticks subtitleIndex:(NSInteger)index error:(NSError **)error;
 - (NSDictionary *)playbackInfo:(NSString *)identifier startTicks:(long long)ticks mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex subtitleIndex:(NSInteger)subtitleIndex error:(NSError **)error;
+- (NSDictionary *)playbackInfo:(NSString *)identifier startTicks:(long long)ticks
+                    mediaSourceID:(NSString *)source audioIndex:(NSInteger)audioIndex
+                    subtitleIndex:(NSInteger)subtitleIndex fallbackTier:(NSUInteger)tier
+                            error:(NSError **)error;
 - (NSURLRequest *)playbackRequest:(NSDictionary *)plan error:(NSError **)error;
 - (BOOL)reportPlayback:(NSString *)event body:(NSDictionary *)body error:(NSError **)error;
 - (NSURLRequest *)subtitleRequest:(NSString *)item mediaSource:(NSString *)source index:(NSInteger)index error:(NSError **)error;
@@ -41,6 +49,8 @@
 - (NSURLRequest *)streamRequest:(NSString *)identifier mediaSource:(NSString *)source error:(NSError **)error;
 // Worker-only integration/session operations; no credential logging.
 - (BOOL)authenticateToken:(NSString *)token error:(NSError **)error;
+- (NSDictionary *)currentUser:(NSError **)error;
+- (NSData *)freshCurrentAvatarWithTag:(NSString *)tag width:(NSUInteger)width error:(NSError **)error;
 - (NSString *)sessionToken; // Worker-thread copy; never include in snapshots or logs.
 - (BOOL)endSession:(NSError **)error;
 - (BOOL)endSessionAndVerifyInvalidation:(NSError **)error;

@@ -26,6 +26,7 @@ typedef NS_ENUM(NSInteger, JFPage) { JFLoginPage, JFLibrariesPage, JFLibraryPage
 - (BOOL)authenticateToken:(NSString *)token error:(NSError **)error;
 - (NSString *)sessionToken;
 - (BOOL)refresh:(NSError **)error;
+- (BOOL)refreshAndScan:(NSError **)error;
 - (BOOL)refreshUncached:(NSError **)error; // explicit user refresh forces live Jellyfin
 - (BOOL)handleEvent:(NSDictionary *)event;
 @property(nonatomic, readonly) NSArray *media;

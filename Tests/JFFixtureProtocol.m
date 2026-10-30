@@ -67,11 +67,21 @@ static NSString *RequestToken(NSURLRequest *r) {
         else if ([@[@"empty",@"items"] containsObject:name]) body=@{@"AccessToken":name,@"User":@{@"Id":@"user1"}};
         else if ([b isEqual:@{@"Username":@"测试用户",@"Pw":@"p\"ass"}]) body=@{@"AccessToken":@"fixture-token",@"User":@{@"Id":@"user1"}};
         else status=400;
+    } else if ([p isEqual:@"/jellyfin/ScheduledTasks"] && [r.HTTPMethod isEqual:@"GET"]) {
+        if ([RequestToken(r) isEqual:@"fixture-token"])
+            body=@[@{@"Key":@"RefreshLibrary",@"Name":@"Scan Media Library",
+                     @"State":@"Running",@"CurrentProgressPercentage":@42,
+                     @"LastExecutionResult":@{@"Status":@"Completed",
+                     @"EndTimeUtc":@"2026-01-01T01:01:01.000Z"}}];
+        else {status=401;body=@{};}
+    } else if ([p isEqual:@"/jellyfin/Library/Refresh"] && [r.HTTPMethod isEqual:@"POST"]) {
+        if ([RequestToken(r) isEqual:@"fixture-token"]) { status=204; body=[NSData data]; }
+        else { status=403; body=@{}; }
     } else if ([p containsString:@"/Sessions/Playing"]) { status=204; body=[NSData data];
     } else if ([p isEqual:@"/jellyfin/Sessions/Logout"]) { loggedOut=YES; status=204; body=[NSData data];
     } else if ([p isEqual:@"/jellyfin/Users/Me"]) {
         if (loggedOut || ![RequestToken(r) isEqual:@"fixture-token"]) status=401;
-        else body=@{@"Id":@"user1"};
+        else body=@{@"Id":@"user1",@"PrimaryImageTag":@"tag001"};
     } else if ([p isEqual:@"/jellyfin/Users/user1/Views"]) {
         NSString *token=RequestToken(r);
         if ([token isEqual:@"empty"]) body=@{@"Items":@[]};

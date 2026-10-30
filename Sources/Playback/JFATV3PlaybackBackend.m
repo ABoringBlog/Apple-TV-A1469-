@@ -250,21 +250,42 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     [callback release];
 }
 - (BOOL)detectNativePresentationExit {
-    // 12H1006 publishes _presentedPlayer even when its WasPopped notification
-    // is absent. Only trust a transition after observing this exact player
-    // presented at least once, so initial asynchronous setup cannot abort play.
+    // 12H1006 may briefly publish a nil/different _presentedPlayer while its
+    // native presentation changes state. A single mismatch must NOT stop the film.
+    // Actual BRMediaPlayerControllerWasPopped notifications still stop immediately.
     if (!_presented || !_started || _stopping || !_player) return NO;
     id manager=JFATV3Object(objc_getClass("BRMediaPlayerManager"),@"sharedInstance");
     if (!manager || !JFATV3Signature(manager,NSSelectorFromString(@"_presentedPlayer"),@encode(id),@[])) return NO;
     id current=JFATV3Object(manager,@"_presentedPlayer");
-    if (current==_player) { _verifiedNativePresentation=YES; return NO; }
-    if (!_verifiedNativePresentation) return NO;
-    long long ticks=[self currentTicks];
-    if (ticks>0) _lastTicks=ticks;
-    JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_PRESENTATION_GONE ticks=%lld",_lastTicks]);
-    _presented=NO; _started=NO; _nativePaused=NO; _verifiedNativePresentation=NO;
-    [NSObject cancelPreviousPerformRequestsWithTarget:self];
-    [self emit:@"popped" ticks:_lastTicks];
+    if (current==_player) {
+        if (_nativeExitSuspectSince>0)
+            JFPlaybackTrace(@"NATIVE_PRESENTATION_RECOVERED");
+        _nativeExitSuspectSince=0;
+        _verifiedNativePresentation=YES;
+        return NO;
+    }
+    if (!_verifiedNativePresentation) return NO; // Initial async presentation.
+    NSTimeInterval now=[NSProcessInfo processInfo].systemUptime;
+    if (_nativeExitSuspectSince<=0 || now<_nativeExitSuspectSince) {
+        _nativeExitSuspectSince=now;
+        JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_PRESENTATION_SUSPECT kind=%@",
+            current ? @"other" : @"nil"]);
+    } else if (now-_nativeExitSuspectSince>=1.20) {
+        long long ticks=[self currentTicks];
+        if (ticks>0) _lastTicks=ticks;
+        JFPlaybackTrace([NSString stringWithFormat:
+            @"NATIVE_PRESENTATION_GONE confirmed=1 elapsed_ms=%lu ticks=%lld",
+            (unsigned long)MAX(0,(now-_nativeExitSuspectSince)*1000.0),_lastTicks]);
+        _presented=NO; _started=NO; _nativePaused=NO;
+        _verifiedNativePresentation=NO; _nativeExitSuspectSince=0;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self];
+        [self emit:@"popped" ticks:_lastTicks];
+        return YES;
+    }
+    // Skip rate/progress sampling while uncertain; schedule exactly one
+    // bounded recheck. Never call endPresentation in this uncertain state.
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sampleProgress) object:nil];
+    [self performSelector:@selector(sampleProgress) withObject:nil afterDelay:0.35];
     return YES;
 }
 - (void)sampleProgress {
@@ -363,7 +384,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
         long long sampled=[self currentTicks];
         if (!(sampled==0 && _lastTicks>10000000LL)) _lastTicks=sampled;
         else JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_POSITION_IGNORE sampled=0 retained=%lld",_lastTicks]);
-        _presented=NO; _started=NO; _nativePaused=NO;
+        _presented=NO; _started=NO; _nativePaused=NO; _nativeExitSuspectSince=0;
         [NSObject cancelPreviousPerformRequestsWithTarget:self];
         JFPlaybackTrace([NSString stringWithFormat:@"NATIVE_NOTIFICATION popped ticks=%lld",_lastTicks]);
         [self emit:@"popped" ticks:_lastTicks];
@@ -378,6 +399,12 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
         [NSObject cancelPreviousPerformRequestsWithTarget:self];
         [self emit:@"failure" ticks:_lastTicks];
     }
+}
+- (void)failAudioCurrentAtTicks:(long long)ticks {
+    JFBackendEvent callback=[_event copy];
+    [self stop];
+    if (callback) callback(@"audio-failure",ticks);
+    [callback release];
 }
 - (void)failCurrentAtTicks:(long long)ticks {
     JFBackendEvent callback=[_event copy];
@@ -437,7 +464,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
         JFPlaybackTrace(@"NATIVE_PRESENT begin");
         ((void(*)(id,SEL,id,id))objc_msgSend)(manager,NSSelectorFromString(@"presentPlayer:options:"),_player,nil);
         _presented=YES;
-        _verifiedNativePresentation=NO;
+        _verifiedNativePresentation=NO; _nativeExitSuspectSince=0;
         // This getter is firmware-verified. Observe the current player before
         // it can be dismissed so exit cleanup doesn't depend on WasPopped.
         [self detectNativePresentationExit];
@@ -460,9 +487,9 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
             } failure:^{
                 if (!target->_gateway || target->_stopping || target->_started)return;
                 JFPlaybackTrace(@"NATIVE_HELD_AUDIO_SETUP_FAILED");
-                [target failCurrentAtTicks:ticks];
+                [target failAudioCurrentAtTicks:ticks];
             }];
-            if (!bound) {JFPlaybackTrace(@"NATIVE_HELD_AUDIO_BIND_FAILED");[self failCurrentAtTicks:ticks];}
+            if (!bound) {JFPlaybackTrace(@"NATIVE_HELD_AUDIO_BIND_FAILED");[self failAudioCurrentAtTicks:ticks];}
             return;
         }
         [self finishHeldNativeStartAtTicks:ticks];
@@ -551,7 +578,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
             if (manager) ((void(*)(id,SEL))objc_msgSend)(manager,NSSelectorFromString(@"endPresentation"));
         }
     } @catch (NSException *exception) {}
-    _presented=NO; _verifiedNativePresentation=NO;
+    _presented=NO; _verifiedNativePresentation=NO; _nativeExitSuspectSince=0;
     _startProgressPending=_resumeProgressPending=_seekProgressPending=NO;
     _zeroPositionActive=NO; _zeroPositionSince=0;
     [self discardPreparedPlayback];
@@ -566,7 +593,7 @@ static NSError *JFATV3NotificationError(NSNotification *notification) {
     [_player release]; _player=nil;
     [_playerController release]; _playerController=nil;
     [_event release]; _event=nil;
-    _positionTicks=0; _lastTicks=0; _presented=NO; _started=NO; _nativePaused=NO; _verifiedNativePresentation=NO;
+    _positionTicks=0; _lastTicks=0; _presented=NO; _started=NO; _nativePaused=NO; _verifiedNativePresentation=NO; _nativeExitSuspectSince=0;
     _ignoreNativeRateUntil=0;
 }
 - (void)dealloc {
